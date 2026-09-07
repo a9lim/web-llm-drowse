@@ -163,6 +163,12 @@ export interface ChatCompletionRequestBase {
   top_p?: number | null;
 
   /**
+   * Limit sampling to the k most likely tokens before applying top-p.
+   * Zero or null leaves the vocabulary uncapped.
+   */
+  top_k?: number | null;
+
+  /**
    * Modify the likelihood of specified tokens appearing in the completion.
    *
    * Accepts a JSON object that maps tokens (specified by their token ID, which varies per model)
@@ -283,6 +289,21 @@ export interface ChatCompletionRequestBase {
      * stages of token sampling.
      */
     enable_latency_breakdown?: boolean | null;
+
+    /** Drowse-only display label for the generated reply header. */
+    drowse_generation_role?: string | null;
+
+    /** Drowse-only structural seat for the generated reply. */
+    drowse_generation_seat?: "user" | "assistant" | null;
+
+    /**
+     * Token IDs emitted for the first N decode steps. Sampling still runs on
+     * every step so the normal RNG stream is preserved.
+     */
+    drowse_forced_prefix_token_ids?: number[] | null;
+
+    /** Token IDs whose exact sampler log probabilities are returned per step. */
+    drowse_score_token_ids?: number[] | null;
   };
 }
 
@@ -476,14 +497,20 @@ export function postInitAndCheckFields(
     },
   );
 
-  // 3. Last message has to be from user or tool
+  // 3. Last message has to occupy the seat opposite the generated reply.
   const lastId = request.messages.length - 1;
-  if (
-    request.messages[lastId].role !== "user" &&
-    request.messages[lastId].role !== "tool"
-  ) {
+  const generationSeat =
+    request.extra_body?.drowse_generation_seat ?? "assistant";
+  const validLastRole =
+    generationSeat === "user"
+      ? request.messages[lastId].role === "assistant"
+      : request.messages[lastId].role === "user" ||
+        request.messages[lastId].role === "tool";
+  if (!validLastRole) {
     throw new MessageOrderError(
-      "Last message should be from either `user` or `tool`.",
+      generationSeat === "user"
+        ? "Last message should be from `assistant` when generating the user seat."
+        : "Last message should be from either `user` or `tool`.",
     );
   }
 
@@ -880,6 +907,9 @@ export type ChatCompletionToolChoiceOption =
 
 //////////////////////////////// 3.1. LOG PROBS ////////////////////////////////
 export interface TopLogprob {
+  /** Drowse extension: tokenizer vocabulary ID for exact local replay. */
+  token_id?: number;
+
   /**
    * The token.
    */
@@ -903,6 +933,9 @@ export interface TopLogprob {
 }
 
 export interface ChatCompletionTokenLogprob {
+  /** Drowse extension: tokenizer vocabulary ID for exact local replay. */
+  token_id?: number;
+
   /**
    * The token.
    */
@@ -930,6 +963,31 @@ export interface ChatCompletionTokenLogprob {
    * `top_logprobs` returned.
    */
   top_logprobs: Array<TopLogprob>;
+
+  /** Compact Drowse sampler snapshot for exact forced replay. */
+  drowse_replay?: DrowseReplayTokenMetadata;
+
+  /** Exact entropy and perplexity of the distribution this token was sampled from. */
+  drowse_sampler?: DrowseSamplerTokenMetadata;
+}
+
+export interface DrowseSamplerTokenMetadata {
+  entropy_nats: number;
+  perplexity: number;
+}
+
+export interface DrowseReplayLogprob {
+  token_id: number;
+  logprob: number;
+}
+
+export interface DrowseReplayTokenMetadata {
+  emitted_token_id: number;
+  sampled_token_id: number;
+  forced_token_id: number | null;
+  selected_logprobs: DrowseReplayLogprob[];
+  argmax: DrowseReplayLogprob;
+  top_logprobs: DrowseReplayLogprob[];
 }
 
 //////////////////////////////// 3.2. OTHERS ////////////////////////////////
@@ -1039,6 +1097,13 @@ export type ChatCompletionFinishReason =
   | "tool_calls"
   | "abort";
 
+/** Drowse extension that disambiguates OpenAI's overloaded finish reason. */
+export type DrowseGenerationFinishReason =
+  | "eos"
+  | "stop_sequence"
+  | "external_stop"
+  | "length";
+
 export namespace ChatCompletion {
   export interface Choice {
     /**
@@ -1048,6 +1113,9 @@ export namespace ChatCompletion {
      * model called a tool, or `abort` if user manually stops the generation.
      */
     finish_reason: ChatCompletionFinishReason;
+
+    /** Exact Drowse terminal classification for this generation. */
+    drowse_finish_reason?: DrowseGenerationFinishReason;
 
     /**
      * The index of the choice in the list of choices.
@@ -1092,6 +1160,9 @@ export namespace ChatCompletionChunk {
      * model called a tool, or `abort` if user manually stops the generation.
      */
     finish_reason: ChatCompletionFinishReason | null;
+
+    /** Exact Drowse terminal classification when this choice has stopped. */
+    drowse_finish_reason?: DrowseGenerationFinishReason;
 
     /**
      * The index of the choice in the list of choices.

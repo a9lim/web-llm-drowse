@@ -32,6 +32,7 @@ jest.mock("../src/llm_chat", () => {
     public prefillCallCount = 0;
     public decodeCallCount = 0;
     public resetCount = 0;
+    public lastGenConfig: Record<string, unknown> | undefined;
     private conversation: Conversation = getConversation(
       {
         system_template: "{system_message}",
@@ -46,6 +47,12 @@ jest.mock("../src/llm_chat", () => {
     private stopFlag = true;
     private message = "";
     private finishReason: string | undefined = undefined;
+    private drowseFinishReason:
+      | "eos"
+      | "stop_sequence"
+      | "external_stop"
+      | "length"
+      | undefined = undefined;
     private curRoundPrefillTotalTokens = 0;
     private curRoundDecodingTotalTokens = 0;
     private curRoundPrefillTotalTime = 0.001;
@@ -81,7 +88,9 @@ jest.mock("../src/llm_chat", () => {
       inp: string,
       msgRole: string,
       roleName?: string,
+      genConfig?: Record<string, unknown>,
     ): Promise<void> {
+      this.lastGenConfig = genConfig;
       this.prefillCallCount++;
       const roleSuffix = roleName ? `(${roleName})` : "";
       this.message = `${msgRole}${roleSuffix}:${inp}`;
@@ -93,6 +102,7 @@ jest.mock("../src/llm_chat", () => {
       this.curRoundDecodingTotalTime = 0.001;
       this.curRoundGrammarPerTokenTotalTime = 0;
       this.finishReason = "length";
+      this.drowseFinishReason = "length";
     }
 
     async decodeStep(genConfig?: { max_tokens?: number | null }) {
@@ -111,6 +121,7 @@ jest.mock("../src/llm_chat", () => {
       ) {
         this.stopFlag = true;
         this.finishReason = "stop";
+        this.drowseFinishReason = "eos";
       }
     }
 
@@ -120,18 +131,31 @@ jest.mock("../src/llm_chat", () => {
 
     triggerStop() {
       this.stopFlag = true;
-      this.finishReason = "stop";
+      this.finishReason = "abort";
+      this.drowseFinishReason = "external_stop";
     }
 
     getMessage() {
       return this.message;
     }
 
+    getDrowseRawMessage() {
+      return this.getMessage();
+    }
+
     getFinishReason() {
       return this.finishReason ?? "stop";
     }
 
+    getDrowseFinishReason() {
+      return this.drowseFinishReason;
+    }
+
     getCurRoundDecodingTotalTokens() {
+      return this.curRoundDecodingTotalTokens;
+    }
+
+    getCurRoundDrowseCompletionTokens() {
       return this.curRoundDecodingTotalTokens;
     }
 
@@ -181,6 +205,28 @@ jest.mock("../src/llm_chat", () => {
     async forwardTokensAndSample(inputIds: Array<number>): Promise<number> {
       return inputIds[0] ?? 0;
     }
+
+    getDrowseRuntimeCapabilities() {
+      return {
+        topK: true,
+        forcedReplay: true,
+        replayScoring: true,
+        tokenizer: true,
+        namedRoles: false,
+        userSeatGeneration: true,
+        sceneStitching: true,
+      };
+    }
+
+    tokenizeDrowseText(text: string) {
+      return text === " leading" ? [31, 32] : [41, 42, 43];
+    }
+
+    decodeDrowseTokens(tokenIds: readonly number[]) {
+      return tokenIds.join(":");
+    }
+
+    async setDrowseStructuredProgram() {}
 
     async runtimeStatsText() {
       return `prefills=${this.prefillCallCount}`;
@@ -412,6 +458,69 @@ describe("MLCEngine deterministic integration", () => {
     );
   });
 
+  test("Drowse capabilities and tokenizer bridge use the selected pipeline", async () => {
+    const { engine } = createEngineWithPipeline();
+    await expect(
+      engine.getDrowseRuntimeCapabilities(MODEL_ID),
+    ).resolves.toEqual({
+      topK: true,
+      forcedReplay: true,
+      replayScoring: true,
+      tokenizer: true,
+      namedRoles: false,
+      userSeatGeneration: true,
+      sceneStitching: true,
+    });
+    await expect(
+      engine.tokenizeDrowseText(" leading", MODEL_ID),
+    ).resolves.toEqual([31, 32]);
+    await expect(
+      engine.tokenizeDrowseText("subword", MODEL_ID),
+    ).resolves.toEqual([41, 42, 43]);
+    await expect(engine.decodeDrowseTokens([31, 32], MODEL_ID)).resolves.toBe(
+      "31:32",
+    );
+  });
+
+  test("Drowse structured program installation waits for GPU uploads", async () => {
+    const { engine, pipeline } = createEngineWithPipeline();
+    let finishUpload!: () => void;
+    const upload = new Promise<void>((resolve) => {
+      finishUpload = resolve;
+    });
+    pipeline.setDrowseStructuredProgram = jest.fn(() => upload);
+    let installed = false;
+    const installing = engine
+      .setDrowseStructuredProgram({} as any, MODEL_ID)
+      .then(() => {
+        installed = true;
+      });
+
+    await Promise.resolve();
+    expect(installed).toBe(false);
+    finishUpload();
+    await installing;
+    expect(installed).toBe(true);
+  });
+
+  test("chatCompletion forwards exact Drowse sampling extensions", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(1);
+    await engine.chatCompletion({
+      model: MODEL_ID,
+      messages: [{ role: "user", content: "score" }],
+      top_k: 17,
+      extra_body: {
+        drowse_forced_prefix_token_ids: [4, 5],
+        drowse_score_token_ids: [4, 9],
+      },
+    });
+    expect((pipeline as any).lastGenConfig).toMatchObject({
+      top_k: 17,
+      drowse_forced_prefix_token_ids: [4, 5],
+      drowse_score_token_ids: [4, 9],
+    });
+  });
+
   test("chatCompletion streaming yields chunks, final delta, and usage data", async () => {
     jest.useFakeTimers().setSystemTime(FIXED_CREATED_DATE);
     const { engine } = createEngineWithPipeline(2);
@@ -441,6 +550,113 @@ describe("MLCEngine deterministic integration", () => {
     const usageChunk = chunks[chunks.length - 1];
     expect(usageChunk.usage?.completion_tokens).toBeGreaterThan(0);
     expect(usageChunk.usage?.prompt_tokens).toBeGreaterThan(0);
+  });
+
+  test("streaming preserves every token boundary across split UTF-8 text", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(2);
+    let step = 0;
+    const rows = [
+      {
+        token_id: 100,
+        token: "�",
+        bytes: [0xef, 0xbf, 0xbd],
+        logprob: -0.2,
+        top_logprobs: [],
+      },
+      {
+        token_id: 101,
+        token: "�",
+        bytes: [0xef, 0xbf, 0xbd],
+        logprob: -0.3,
+        top_logprobs: [],
+      },
+    ];
+    pipeline.prefillStep = jest.fn(async () => {
+      step = 1;
+    });
+    pipeline.decodeStep = jest.fn(async () => {
+      step = 2;
+    });
+    pipeline.stopped = jest.fn(() => step >= 2);
+    pipeline.getMessage = jest.fn(() => (step === 1 ? "�" : "😀"));
+    pipeline.getTokenLogprobArray = jest.fn(() => rows.slice(0, step));
+    pipeline.getFinishReason = jest.fn(() => "stop");
+    pipeline.getDrowseFinishReason = jest.fn(() => "eos");
+    pipeline.getCurRoundDrowseCompletionTokens = jest.fn(() => 2);
+
+    const iterable = (await engine.completion({
+      model: MODEL_ID,
+      prompt: "emoji",
+      max_tokens: 2,
+      stream: true,
+      logprobs: true,
+      top_logprobs: 1,
+    })) as AsyncIterable<Completion>;
+    const chunks: Completion[] = [];
+    for await (const chunk of iterable) chunks.push(chunk);
+    const tokenChunks = chunks.filter(
+      (chunk) => chunk.choices[0].logprobs?.content?.length === 1,
+    );
+
+    expect(tokenChunks).toHaveLength(2);
+    expect(tokenChunks.map((chunk) => chunk.choices[0].text)).toEqual([
+      "",
+      "😀",
+    ]);
+    expect(
+      tokenChunks.map((chunk) => chunk.choices[0].logprobs?.content?.[0]),
+    ).toMatchObject([
+      { token_id: 100, token: "", bytes: [] },
+      { token_id: 101, token: "😀", bytes: [240, 159, 152, 128] },
+    ]);
+  });
+
+  test("Drowse token decoding does not re-enter the model lock while a stream chunk is yielded", async () => {
+    const { engine } = createEngineWithPipeline(1);
+    const stream = (await engine.completion({
+      model: MODEL_ID,
+      prompt: "decode this chunk",
+      max_tokens: 1,
+      stream: true,
+    })) as AsyncIterable<Completion>;
+    const lock = (engine as any).loadedModelIdToLock.get(MODEL_ID);
+
+    for await (const chunk of stream) {
+      expect(chunk.object).toBe("text_completion");
+      const acquire = jest
+        .spyOn(lock, "acquire")
+        .mockRejectedValue(new Error("stream lock re-entry"));
+      await expect(engine.decodeDrowseTokens([31, 32], MODEL_ID)).resolves.toBe(
+        "31:32",
+      );
+      expect(acquire).not.toHaveBeenCalled();
+      acquire.mockRestore();
+      break;
+    }
+  });
+
+  test("a completed interrupt does not cancel the next request", async () => {
+    const { engine, pipeline } = createEngineWithPipeline(8);
+    const stream = (await engine.completion({
+      model: MODEL_ID,
+      prompt: "interrupt me",
+      max_tokens: 8,
+      stream: true,
+    })) as AsyncIterable<Completion>;
+    let chunks = 0;
+    for await (const chunk of stream) {
+      expect(chunk.object).toBe("text_completion");
+      chunks += 1;
+      if (chunks === 1) await engine.interruptGenerate();
+    }
+    const prefillCount = (pipeline as any).prefillCallCount;
+    const response = (await engine.completion({
+      model: MODEL_ID,
+      prompt: "run next",
+      max_tokens: 1,
+    })) as Completion;
+    expect((pipeline as any).prefillCallCount).toBe(prefillCount + 1);
+    expect(response.choices[0].text).toContain("run next");
   });
 
   test("chatCompletion without specifying model when multiple loaded throws error", async () => {

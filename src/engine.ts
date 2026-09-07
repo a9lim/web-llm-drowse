@@ -76,9 +76,42 @@ import {
 } from "./cache_util";
 import { EmbeddingPipeline } from "./embedding";
 import { verifyIntegrity } from "./integrity";
+import {
+  DrowseCaptureRow,
+  DrowsePreparedCaptureRow,
+  DrowseRankOneProgram,
+  DrowseRankOneResidualCaptureV1,
+  DrowseStructuredProgram,
+  DrowseResidualCapture,
+  DrowseRuntimeCapabilities,
+  DrowseStructuredHookProfile,
+  DrowseSaeDictionary,
+  DrowseJlensDictionary,
+  DrowseJlensTopTokenReadout,
+  DrowseMeasurementBundle,
+  DrowseSaeTopFeatureReadout,
+} from "./drowse";
+import { requestGPUDeviceFromAdapter } from "./gpu";
 
 function getUnixTimestampSeconds(): number {
   return Math.floor(Date.now() / 1000);
+}
+
+function hasDrowseReplay(config: GenerationConfig): boolean {
+  return (
+    config.drowse_forced_prefix_token_ids != null ||
+    config.drowse_score_token_ids != null
+  );
+}
+
+function requireDrowseFinishReason(
+  pipeline: LLMChatPipeline,
+): API.DrowseGenerationFinishReason {
+  const reason = pipeline.getDrowseFinishReason();
+  if (reason === undefined) {
+    throw new Error("Drowse generation stopped without an exact finish reason");
+  }
+  return reason;
 }
 
 /**
@@ -135,6 +168,7 @@ export class MLCEngine implements MLCEngineInterface {
    * each model only processes one request at at time.
    */
   private loadedModelIdToLock: Map<string, CustomLock>;
+  private drowseStreamingControlWindows: Set<string>;
 
   // Others
   private logger: (msg: string) => void = log.info;
@@ -155,6 +189,7 @@ export class MLCEngine implements MLCEngineInterface {
     this.loadedModelIdToChatConfig = new Map<string, ChatConfig>();
     this.loadedModelIdToModelType = new Map<string, ModelType>();
     this.loadedModelIdToLock = new Map<string, CustomLock>();
+    this.drowseStreamingControlWindows = new Set<string>();
     this.appConfig = engineConfig?.appConfig || prebuiltAppConfig;
     this.setLogLevel(engineConfig?.logLevel || DefaultLogLevel);
     this.setInitProgressCallback(engineConfig?.initProgressCallback);
@@ -307,7 +342,13 @@ export class MLCEngine implements MLCEngineInterface {
       throw new MissingModelWasmError(modelRecord.model_id);
     }
     const fetchWasmSource = async () => {
-      if (wasmUrl.includes("localhost")) {
+      if (this.appConfig.artifactCache !== undefined) {
+        return await wasmCache.fetchWithCache(
+          wasmUrl,
+          "arraybuffer",
+          this.reloadController?.signal,
+        );
+      } else if (wasmUrl.includes("localhost")) {
         // do not cache wasm on local host as we might update code frequently
         return (await fetch(wasmUrl)).arrayBuffer();
       } else if (!wasmUrl.startsWith("http")) {
@@ -345,7 +386,9 @@ export class MLCEngine implements MLCEngineInterface {
     }
 
     // detect GPU
-    const gpuDetectOutput = await tvmjs.detectGPUDevice();
+    const gpuDetectOutput = this.appConfig.gpuAdapter
+      ? await requestGPUDeviceFromAdapter(this.appConfig.gpuAdapter)
+      : await tvmjs.detectGPUDevice();
     if (gpuDetectOutput == undefined) {
       throw new WebGPUNotAvailableError();
     }
@@ -374,6 +417,7 @@ export class MLCEngine implements MLCEngineInterface {
     let deviceLostInReload = false;
     gpuDetectOutput.device.lost.then((info: any) => {
       if (this.deviceLostIsError) {
+        this.appConfig.onDeviceLost?.(info);
         log.error(
           `Device was lost. This can happen due to insufficient memory or other GPU constraints. ` +
             `Detailed error: ${info}. Please try to reload WebLLM with a less resource-intensive model.`,
@@ -408,6 +452,11 @@ export class MLCEngine implements MLCEngineInterface {
         tokenizer,
         curModelConfig,
         logitProcessor,
+        {
+          maxBufferSize: gpuDetectOutput.device.limits.maxBufferSize,
+          maxStorageBufferBindingSize:
+            gpuDetectOutput.device.limits.maxStorageBufferBindingSize,
+        },
       );
     }
     await newPipeline.asyncLoadWebGPUPipelines();
@@ -462,7 +511,6 @@ export class MLCEngine implements MLCEngineInterface {
     chatConfig: ChatConfig,
     genConfig: GenerationConfig,
   ): Promise<string> {
-    this.interruptSignal = false;
     if (genConfig !== undefined) {
       postInitAndCheckGenerationConfigValues(genConfig);
     }
@@ -535,41 +583,39 @@ export class MLCEngine implements MLCEngineInterface {
     const created = getUnixTimestampSeconds();
     const id = crypto.randomUUID();
     this.interruptSignal = false;
-    let prevMessageLength = 0; // to know where to start slicing the delta; does not count �
+    let prevRawMessageLength = 0;
 
-    function _countTrailingReplacementChar(curMessage: string): number {
-      let cntr = 0;
-      for (let i = curMessage.length - 1; i >= 0; i--) {
-        if (curMessage.charAt(i) === "�") {
-          cntr += 1;
-        } else {
-          return cntr;
-        }
+    function _stableMessage(curMessage: string): string {
+      let stableLength = curMessage.length;
+      while (stableLength > 0 && curMessage.charAt(stableLength - 1) === "�") {
+        stableLength -= 1;
       }
-      return cntr;
+      return curMessage.slice(0, stableLength);
     }
 
     async function _getChunk(
       selectedPipeline: LLMChatPipeline,
     ): Promise<ChatCompletionChunk | Completion | undefined> {
-      // Remove the replacement character (U+FFFD) from the response to handle emojis.
-      // Each emoji is made up of multiples of 4 tokens; when truncated, it is displayed as �, so
-      // we skip this delta until a full emoji is rendered
-      // TODO(Charlie): This does not consider cases of � not being emoji, need to fix with Streamer
-      const curMessage = selectedPipeline.getMessage();
-      const numTrailingReplacementChar =
-        _countTrailingReplacementChar(curMessage);
-      if (numTrailingReplacementChar % 4 !== 0) {
-        return undefined;
-      }
-
-      const deltaMessage = curMessage.slice(prevMessageLength);
-      prevMessageLength = curMessage.length;
-      const logprobs = request.logprobs
-        ? ({
-            content: selectedPipeline.getTokenLogprobArray().slice(-1), // always the last entry
-          } as ChatCompletionChunk.Choice.Logprobs)
-        : null;
+      const curMessage = _stableMessage(selectedPipeline.getDrowseRawMessage());
+      const deltaMessage = curMessage.slice(prevRawMessageLength);
+      prevRawMessageLength = curMessage.length;
+      const drowseFinishReason = selectedPipeline.stopped()
+        ? selectedPipeline.getDrowseFinishReason()
+        : undefined;
+      const latestLogprobs = selectedPipeline
+        .getTokenLogprobArray()
+        .slice(-1)
+        .map((row) => ({
+          ...row,
+          token: deltaMessage,
+          bytes: Array.from(new TextEncoder().encode(deltaMessage)),
+        }));
+      const logprobs =
+        request.logprobs || hasDrowseReplay(genConfig)
+          ? ({
+              content: latestLogprobs,
+            } as ChatCompletionChunk.Choice.Logprobs)
+          : null;
       if (isChatCompletion) {
         const chunk: ChatCompletionChunk = {
           id: id,
@@ -577,6 +623,9 @@ export class MLCEngine implements MLCEngineInterface {
             {
               delta: { content: deltaMessage, role: "assistant" },
               finish_reason: null, // not finished yet
+              ...(drowseFinishReason === undefined
+                ? {}
+                : { drowse_finish_reason: drowseFinishReason }),
               index: 0,
               logprobs: logprobs,
             },
@@ -593,6 +642,9 @@ export class MLCEngine implements MLCEngineInterface {
             {
               text: deltaMessage,
               finish_reason: null, // not finished yet
+              ...(drowseFinishReason === undefined
+                ? {}
+                : { drowse_finish_reason: drowseFinishReason }),
               index: 0,
               logprobs: logprobs,
             },
@@ -615,7 +667,12 @@ export class MLCEngine implements MLCEngineInterface {
       throw err;
     }
     if (curChunk) {
-      yield curChunk;
+      this.drowseStreamingControlWindows.add(model);
+      try {
+        yield curChunk;
+      } finally {
+        this.drowseStreamingControlWindows.delete(model);
+      }
     }
 
     while (!pipeline.stopped()) {
@@ -633,7 +690,12 @@ export class MLCEngine implements MLCEngineInterface {
         throw err;
       }
       if (curChunk) {
-        yield curChunk;
+        this.drowseStreamingControlWindows.add(model);
+        try {
+          yield curChunk;
+        } finally {
+          this.drowseStreamingControlWindows.delete(model);
+        }
       }
     }
 
@@ -645,6 +707,13 @@ export class MLCEngine implements MLCEngineInterface {
     // 3. Last chunk empty marking the end
     // If function calling, use the last chunk to return tool_calls
     let finish_reason = pipeline.getFinishReason()!;
+    let drowse_finish_reason: API.DrowseGenerationFinishReason;
+    try {
+      drowse_finish_reason = requireDrowseFinishReason(pipeline);
+    } catch (error) {
+      await lock.release();
+      throw error;
+    }
     let tool_calls:
       | Array<ChatCompletionChunk.Choice.Delta.ToolCall>
       | undefined;
@@ -675,6 +744,7 @@ export class MLCEngine implements MLCEngineInterface {
                 }
               : {},
             finish_reason: finish_reason,
+            drowse_finish_reason,
             index: 0,
           },
         ],
@@ -690,6 +760,7 @@ export class MLCEngine implements MLCEngineInterface {
           {
             text: "",
             finish_reason: finish_reason,
+            drowse_finish_reason,
             index: 0,
           },
         ],
@@ -706,7 +777,7 @@ export class MLCEngine implements MLCEngineInterface {
         "response_format" in request &&
         (request.response_format?.type === "grammar" ||
           request.response_format?.type === "json_object");
-      const completion_tokens = pipeline.getCurRoundDecodingTotalTokens();
+      const completion_tokens = pipeline.getCurRoundDrowseCompletionTokens();
       const prompt_tokens = pipeline.getCurRoundPrefillTotalTokens();
       const prefill_tokens_per_s = pipeline.getCurRoundPrefillTokensPerSec();
       const decode_tokens_per_s = pipeline.getCurRoundDecodingTokensPerSec();
@@ -814,6 +885,7 @@ export class MLCEngine implements MLCEngineInterface {
       max_tokens: request.max_tokens,
       stop: request.stop,
       top_p: request.top_p,
+      top_k: request.top_k,
       temperature: request.temperature,
       logit_bias: request.logit_bias,
       logprobs: request.logprobs,
@@ -822,6 +894,11 @@ export class MLCEngine implements MLCEngineInterface {
       ignore_eos: request.ignore_eos,
       enable_thinking: request.extra_body?.enable_thinking,
       enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
+      drowse_generation_role: request.extra_body?.drowse_generation_role,
+      drowse_generation_seat: request.extra_body?.drowse_generation_seat,
+      drowse_forced_prefix_token_ids:
+        request.extra_body?.drowse_forced_prefix_token_ids,
+      drowse_score_token_ids: request.extra_body?.drowse_score_token_ids,
     };
 
     // 0.5 Block wait until this pipeline finishes all previous requests
@@ -842,6 +919,7 @@ export class MLCEngine implements MLCEngineInterface {
 
     // Big try-finally to release lock in case of errors
     try {
+      this.interruptSignal = false;
       if (request.seed !== null && request.seed !== undefined) {
         selectedPipeline.setSeed(request.seed);
       }
@@ -889,12 +967,14 @@ export class MLCEngine implements MLCEngineInterface {
 
         choices.push({
           finish_reason: finish_reason,
+          drowse_finish_reason: requireDrowseFinishReason(selectedPipeline),
           index: i,
-          logprobs: request.logprobs
-            ? ({
-                content: selectedPipeline.getTokenLogprobArray(),
-              } as ChatCompletion.Choice.Logprobs)
-            : null,
+          logprobs:
+            request.logprobs || hasDrowseReplay(genConfig)
+              ? ({
+                  content: selectedPipeline.getTokenLogprobArray(),
+                } as ChatCompletion.Choice.Logprobs)
+              : null,
           message: isFunctionCalling
             ? {
                 content: null,
@@ -906,7 +986,8 @@ export class MLCEngine implements MLCEngineInterface {
                 role: "assistant",
               },
         });
-        completion_tokens += selectedPipeline.getCurRoundDecodingTotalTokens();
+        completion_tokens +=
+          selectedPipeline.getCurRoundDrowseCompletionTokens();
         prompt_tokens += selectedPipeline.getCurRoundPrefillTotalTokens();
         prefill_time += selectedPipeline.getCurRoundPrefillTotalTime();
         decode_time += selectedPipeline.getCurRoundDecodingTotalTime();
@@ -997,11 +1078,16 @@ export class MLCEngine implements MLCEngineInterface {
       max_tokens: request.max_tokens,
       stop: request.stop,
       top_p: request.top_p,
+      top_k: request.top_k,
       temperature: request.temperature,
       logit_bias: request.logit_bias,
       logprobs: request.logprobs,
       top_logprobs: request.top_logprobs,
       ignore_eos: request.ignore_eos,
+      enable_latency_breakdown: request.extra_body?.enable_latency_breakdown,
+      drowse_forced_prefix_token_ids:
+        request.extra_body?.drowse_forced_prefix_token_ids,
+      drowse_score_token_ids: request.extra_body?.drowse_score_token_ids,
     };
 
     // 0.5 Block wait until this pipeline finishes all previous requests
@@ -1022,6 +1108,7 @@ export class MLCEngine implements MLCEngineInterface {
 
     // Big try-finally to release lock in case of errors
     try {
+      this.interruptSignal = false;
       if (request.seed !== null && request.seed !== undefined) {
         selectedPipeline.setSeed(request.seed);
       }
@@ -1051,15 +1138,18 @@ export class MLCEngine implements MLCEngineInterface {
 
         choices.push({
           finish_reason: finish_reason,
+          drowse_finish_reason: requireDrowseFinishReason(selectedPipeline),
           index: i,
-          logprobs: request.logprobs
-            ? ({
-                content: selectedPipeline.getTokenLogprobArray(),
-              } as ChatCompletion.Choice.Logprobs)
-            : null,
+          logprobs:
+            request.logprobs || hasDrowseReplay(genConfig)
+              ? ({
+                  content: selectedPipeline.getTokenLogprobArray(),
+                } as ChatCompletion.Choice.Logprobs)
+              : null,
           text: request.echo ? request.prompt + outputMessage : outputMessage,
         });
-        completion_tokens += selectedPipeline.getCurRoundDecodingTotalTokens();
+        completion_tokens +=
+          selectedPipeline.getCurRoundDrowseCompletionTokens();
         prompt_tokens += selectedPipeline.getCurRoundPrefillTotalTokens();
         prefill_time += selectedPipeline.getCurRoundPrefillTotalTime();
         decode_time += selectedPipeline.getCurRoundDecodingTotalTime();
@@ -1302,6 +1392,459 @@ export class MLCEngine implements MLCEngineInterface {
     return selectedPipeline.forwardTokensAndSample(inputIds, isPrefill);
   }
 
+  async supportsDrowseRankOneHooks(modelId?: string): Promise<boolean> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "supportsDrowseRankOneHooks",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.supportsDrowseRankOneHooks();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async supportsDrowseStructuredHooks(modelId?: string): Promise<boolean> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "supportsDrowseStructuredHooks",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.supportsDrowseStructuredHooks();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async supportsDrowseCurvedHooks(modelId?: string): Promise<boolean> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "supportsDrowseCurvedHooks",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.supportsDrowseCurvedHooks();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async supportsDrowseResidualCapture(modelId?: string): Promise<boolean> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "supportsDrowseResidualCapture",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.supportsDrowseResidualCapture();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async supportsDrowseRankOneResidualCaptureV1(
+    modelId?: string,
+  ): Promise<boolean> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "supportsDrowseRankOneResidualCaptureV1",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.supportsDrowseRankOneResidualCaptureV1();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async getDrowseRuntimeCapabilities(
+    modelId?: string,
+  ): Promise<DrowseRuntimeCapabilities> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "getDrowseRuntimeCapabilities",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.getDrowseRuntimeCapabilities();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async getDrowseStructuredHookProfile(
+    modelId?: string,
+  ): Promise<DrowseStructuredHookProfile> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "getDrowseStructuredHookProfile",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.getDrowseStructuredHookProfile();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async tokenizeDrowseText(text: string, modelId?: string): Promise<number[]> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "tokenizeDrowseText",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.tokenizeDrowseText(text);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async decodeDrowseTokens(
+    tokenIds: readonly number[],
+    modelId?: string,
+  ): Promise<string> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "decodeDrowseTokens",
+      modelId,
+    );
+    if (this.drowseStreamingControlWindows.has(selectedModelId)) {
+      return selectedPipeline.decodeDrowseTokens(tokenIds);
+    }
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.decodeDrowseTokens(tokenIds);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async prepareDrowseCaptureRows(
+    rows: DrowseCaptureRow[],
+    specialTokenIds: number[],
+    modelId?: string,
+  ): Promise<DrowsePreparedCaptureRow[]> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "prepareDrowseCaptureRows",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return selectedPipeline.prepareDrowseCaptureRows(rows, specialTokenIds);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async captureDrowseResiduals(
+    inputIds: number[],
+    positions: number[],
+    modelId?: string,
+  ): Promise<DrowseResidualCapture> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "captureDrowseResiduals",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.captureDrowseResiduals(inputIds, positions);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async captureDrowseRankOneResidualsV1(
+    inputIds: number[],
+    positions: number[],
+    program: DrowseRankOneProgram,
+    modelId?: string,
+  ): Promise<DrowseRankOneResidualCaptureV1> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "captureDrowseRankOneResidualsV1",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.captureDrowseRankOneResidualsV1(
+        inputIds,
+        positions,
+        program,
+      );
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async setDrowseRankOneProgram(
+    program: DrowseRankOneProgram,
+    modelId?: string,
+  ): Promise<void> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "setDrowseRankOneProgram",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      selectedPipeline.setDrowseRankOneProgram(program);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async setDrowseStructuredProgram(
+    program: DrowseStructuredProgram,
+    modelId?: string,
+  ): Promise<void> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "setDrowseStructuredProgram",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      await selectedPipeline.setDrowseStructuredProgram(program);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async updateDrowseStructuredControls(
+    affineActive: Uint32Array,
+    curveActive?: Uint32Array,
+    modelId?: string,
+  ): Promise<void> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "updateDrowseStructuredControls",
+      modelId,
+    );
+    if (this.drowseStreamingControlWindows.has(selectedModelId)) {
+      await selectedPipeline.updateDrowseStructuredControls(
+        affineActive,
+        curveActive,
+      );
+      return;
+    }
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      await selectedPipeline.updateDrowseStructuredControls(
+        affineActive,
+        curveActive,
+      );
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async clearDrowseRankOneProgram(modelId?: string): Promise<void> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "clearDrowseRankOneProgram",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      selectedPipeline.clearDrowseRankOneProgram();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async setDrowseSaeDictionary(
+    dictionary: DrowseSaeDictionary,
+    modelId?: string,
+  ): Promise<void> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "setDrowseSaeDictionary",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      await selectedPipeline.setDrowseSaeDictionary(dictionary);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async clearDrowseSaeDictionary(modelId?: string): Promise<void> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "clearDrowseSaeDictionary",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      await selectedPipeline.clearDrowseSaeDictionary();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async setDrowseJlensDictionary(
+    dictionary: DrowseJlensDictionary,
+    modelId?: string,
+  ): Promise<void> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "setDrowseJlensDictionary",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      await selectedPipeline.setDrowseJlensDictionary(dictionary);
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async clearDrowseJlensDictionary(modelId?: string): Promise<void> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "clearDrowseJlensDictionary",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      await selectedPipeline.clearDrowseJlensDictionary();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async readDrowseJlensTopTokens(
+    modelId?: string,
+  ): Promise<DrowseJlensTopTokenReadout | undefined> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "readDrowseJlensTopTokens",
+      modelId,
+    );
+    if (this.drowseStreamingControlWindows.has(selectedModelId)) {
+      return await selectedPipeline.readDrowseJlensTopTokens();
+    }
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.readDrowseJlensTopTokens();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async readDrowseMeasurementBundle(
+    modelId?: string,
+  ): Promise<DrowseMeasurementBundle> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "readDrowseMeasurementBundle",
+      modelId,
+    );
+    if (this.drowseStreamingControlWindows.has(selectedModelId)) {
+      return await selectedPipeline.readDrowseMeasurementBundle();
+    }
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.readDrowseMeasurementBundle();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async readDrowseSaeTopFeatures(
+    modelId?: string,
+  ): Promise<DrowseSaeTopFeatureReadout | undefined> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "readDrowseSaeTopFeatures",
+      modelId,
+    );
+    if (this.drowseStreamingControlWindows.has(selectedModelId)) {
+      return await selectedPipeline.readDrowseSaeTopFeatures();
+    }
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.readDrowseSaeTopFeatures();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async readDrowseMeasurements(
+    modelId?: string,
+  ): Promise<Float32Array | undefined> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "readDrowseMeasurements",
+      modelId,
+    );
+    if (this.drowseStreamingControlWindows.has(selectedModelId)) {
+      return await selectedPipeline.readDrowseMeasurements();
+    }
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.readDrowseMeasurements();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async readDrowseGeometryMeasurements(
+    modelId?: string,
+  ): Promise<Float32Array | undefined> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "readDrowseGeometryMeasurements",
+      modelId,
+    );
+    if (this.drowseStreamingControlWindows.has(selectedModelId)) {
+      return await selectedPipeline.readDrowseGeometryMeasurements();
+    }
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.readDrowseGeometryMeasurements();
+    } finally {
+      await lock.release();
+    }
+  }
+
+  async resolveDrowseJlensTokenDirections(
+    bindingId: string,
+    layerIndices: readonly number[],
+    tokenIds: readonly number[],
+    modelId?: string,
+  ): Promise<Float32Array> {
+    const [selectedModelId, selectedPipeline] = this.getLLMStates(
+      "resolveDrowseJlensTokenDirections",
+      modelId,
+    );
+    const lock = this.loadedModelIdToLock.get(selectedModelId)!;
+    await lock.acquire();
+    try {
+      return await selectedPipeline.resolveDrowseJlensTokenDirections(
+        bindingId,
+        layerIndices,
+        tokenIds,
+      );
+    } finally {
+      await lock.release();
+    }
+  }
+
   /**
    * Get the current generated response.
    *
@@ -1402,8 +1945,16 @@ export class MLCEngine implements MLCEngineInterface {
       ] as ChatCompletionMessageParam;
       input_str = last_msg.content as string;
       input_role_str =
-        last_msg.role === "user" && last_msg.name ? last_msg.name : undefined;
-      lastMsgRole = last_msg.role === "tool" ? Role.tool : Role.user;
+        (last_msg.role === "user" || last_msg.role === "assistant") &&
+        last_msg.name
+          ? last_msg.name
+          : undefined;
+      lastMsgRole =
+        last_msg.role === "tool"
+          ? Role.tool
+          : last_msg.role === "assistant"
+            ? Role.assistant
+            : Role.user;
     } else {
       // For CompletionCreateParams, the input is just the prompt
       input_str = input.prompt;

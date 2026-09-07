@@ -42,10 +42,14 @@ export {
   ChatCompletionToolChoiceOption,
   TopLogprob,
   ChatCompletionTokenLogprob,
+  DrowseReplayLogprob,
+  DrowseReplayTokenMetadata,
+  DrowseSamplerTokenMetadata,
   ChatCompletionMessage,
   CompletionUsage,
   ResponseFormat,
   ChatCompletionFinishReason,
+  DrowseGenerationFinishReason,
 } from "./chat_completion";
 
 export {

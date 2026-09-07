@@ -15,6 +15,21 @@ import {
   CreateEmbeddingResponse,
 } from "./openai_api_protocols/index";
 import * as API from "./openai_api_protocols/index";
+import {
+  DrowseCaptureRow,
+  DrowsePreparedCaptureRow,
+  DrowseRankOneProgram,
+  DrowseRankOneResidualCaptureV1,
+  DrowseStructuredProgram,
+  DrowseResidualCapture,
+  DrowseRuntimeCapabilities,
+  DrowseStructuredHookProfile,
+  DrowseSaeDictionary,
+  DrowseJlensDictionary,
+  DrowseJlensTopTokenReadout,
+  DrowseMeasurementBundle,
+  DrowseSaeTopFeatureReadout,
+} from "./drowse";
 
 /**
  * Report during intialization.
@@ -233,6 +248,107 @@ export interface MLCEngineInterface {
     isPrefill: boolean,
     modelId?: string,
   ): Promise<number>;
+
+  supportsDrowseRankOneHooks(modelId?: string): Promise<boolean>;
+
+  supportsDrowseStructuredHooks(modelId?: string): Promise<boolean>;
+
+  supportsDrowseCurvedHooks(modelId?: string): Promise<boolean>;
+
+  supportsDrowseResidualCapture(modelId?: string): Promise<boolean>;
+
+  supportsDrowseRankOneResidualCaptureV1(modelId?: string): Promise<boolean>;
+
+  getDrowseRuntimeCapabilities(
+    modelId?: string,
+  ): Promise<DrowseRuntimeCapabilities>;
+
+  getDrowseStructuredHookProfile(
+    modelId?: string,
+  ): Promise<DrowseStructuredHookProfile>;
+
+  tokenizeDrowseText(text: string, modelId?: string): Promise<number[]>;
+
+  decodeDrowseTokens(
+    tokenIds: readonly number[],
+    modelId?: string,
+  ): Promise<string>;
+
+  prepareDrowseCaptureRows(
+    rows: DrowseCaptureRow[],
+    specialTokenIds: number[],
+    modelId?: string,
+  ): Promise<DrowsePreparedCaptureRow[]>;
+
+  captureDrowseResiduals(
+    inputIds: number[],
+    positions: number[],
+    modelId?: string,
+  ): Promise<DrowseResidualCapture>;
+
+  captureDrowseRankOneResidualsV1(
+    inputIds: number[],
+    positions: number[],
+    program: DrowseRankOneProgram,
+    modelId?: string,
+  ): Promise<DrowseRankOneResidualCaptureV1>;
+
+  setDrowseRankOneProgram(
+    program: DrowseRankOneProgram,
+    modelId?: string,
+  ): Promise<void>;
+
+  setDrowseStructuredProgram(
+    program: DrowseStructuredProgram,
+    modelId?: string,
+  ): Promise<void>;
+
+  updateDrowseStructuredControls(
+    affineActive: Uint32Array,
+    curveActive?: Uint32Array,
+    modelId?: string,
+  ): Promise<void>;
+
+  clearDrowseRankOneProgram(modelId?: string): Promise<void>;
+
+  setDrowseSaeDictionary(
+    dictionary: DrowseSaeDictionary,
+    modelId?: string,
+  ): Promise<void>;
+
+  clearDrowseSaeDictionary(modelId?: string): Promise<void>;
+
+  setDrowseJlensDictionary(
+    dictionary: DrowseJlensDictionary,
+    modelId?: string,
+  ): Promise<void>;
+
+  clearDrowseJlensDictionary(modelId?: string): Promise<void>;
+
+  readDrowseMeasurementBundle(
+    modelId?: string,
+  ): Promise<DrowseMeasurementBundle>;
+
+  readDrowseJlensTopTokens(
+    modelId?: string,
+  ): Promise<DrowseJlensTopTokenReadout | undefined>;
+
+  readDrowseSaeTopFeatures(
+    modelId?: string,
+  ): Promise<DrowseSaeTopFeatureReadout | undefined>;
+
+  readDrowseMeasurements(modelId?: string): Promise<Float32Array | undefined>;
+
+  readDrowseGeometryMeasurements(
+    modelId?: string,
+  ): Promise<Float32Array | undefined>;
+
+  resolveDrowseJlensTokenDirections(
+    bindingId: string,
+    layerIndices: readonly number[],
+    tokenIds: readonly number[],
+    modelId?: string,
+  ): Promise<Float32Array>;
 
   /**
    * Set MLCEngine logging output level

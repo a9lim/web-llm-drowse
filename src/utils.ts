@@ -86,6 +86,15 @@ export function areAppConfigsEqual(
   ) {
     return false;
   }
+  if (config1.artifactCache !== config2.artifactCache) {
+    return false;
+  }
+  if (
+    config1.gpuAdapter !== config2.gpuAdapter ||
+    config1.onDeviceLost !== config2.onDeviceLost
+  ) {
+    return false;
+  }
 
   // Check if both configurations have the same number of model records
   if (config1.model_list.length !== config2.model_list.length) {

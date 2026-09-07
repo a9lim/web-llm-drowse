@@ -15,6 +15,26 @@ const completionMock = jest.fn<(...args: any[]) => Promise<any>>();
 const embeddingMock = jest.fn<(...args: any[]) => Promise<any>>();
 const setLogitRegistryMock = jest.fn<(...args: any[]) => void>();
 const setAppConfigMock = jest.fn<(...args: any[]) => void>();
+const supportsDrowseMock = jest.fn<(...args: any[]) => Promise<boolean>>();
+const setDrowseMock = jest.fn<(...args: any[]) => Promise<void>>();
+const clearDrowseMock = jest.fn<(...args: any[]) => Promise<void>>();
+const readDrowseMock = jest.fn<(...args: any[]) => Promise<Float32Array>>();
+const supportsDrowseCaptureMock =
+  jest.fn<(...args: any[]) => Promise<boolean>>();
+const captureDrowseMock = jest.fn<(...args: any[]) => Promise<any>>();
+const prepareDrowseCaptureMock = jest.fn<(...args: any[]) => Promise<any>>();
+const drowseCapabilitiesMock = jest.fn<(...args: any[]) => Promise<any>>();
+const drowseProfileMock = jest.fn<(...args: any[]) => Promise<any>>();
+const tokenizeDrowseMock = jest.fn<(...args: any[]) => Promise<number[]>>();
+const decodeDrowseMock = jest.fn<(...args: any[]) => Promise<string>>();
+const setDrowseSaeMock = jest.fn<(...args: any[]) => Promise<void>>();
+const clearDrowseSaeMock = jest.fn<(...args: any[]) => Promise<void>>();
+const setDrowseJlensMock = jest.fn<(...args: any[]) => Promise<void>>();
+const clearDrowseJlensMock = jest.fn<(...args: any[]) => Promise<void>>();
+const resolveDrowseJlensMock =
+  jest.fn<(...args: any[]) => Promise<Float32Array>>();
+const readDrowseJlensTopMock = jest.fn<(...args: any[]) => Promise<any>>();
+const readDrowseSaeTopMock = jest.fn<(...args: any[]) => Promise<any>>();
 
 const mockEngineInstance: Record<string, any> = {
   reload: reloadMock,
@@ -27,6 +47,25 @@ const mockEngineInstance: Record<string, any> = {
   }),
   setLogitProcessorRegistry: setLogitRegistryMock,
   setAppConfig: setAppConfigMock,
+  supportsDrowseRankOneHooks: supportsDrowseMock,
+  setDrowseRankOneProgram: setDrowseMock,
+  setDrowseStructuredProgram: setDrowseMock,
+  clearDrowseRankOneProgram: clearDrowseMock,
+  readDrowseMeasurements: readDrowseMock,
+  supportsDrowseResidualCapture: supportsDrowseCaptureMock,
+  captureDrowseResiduals: captureDrowseMock,
+  prepareDrowseCaptureRows: prepareDrowseCaptureMock,
+  getDrowseRuntimeCapabilities: drowseCapabilitiesMock,
+  getDrowseStructuredHookProfile: drowseProfileMock,
+  tokenizeDrowseText: tokenizeDrowseMock,
+  decodeDrowseTokens: decodeDrowseMock,
+  setDrowseSaeDictionary: setDrowseSaeMock,
+  clearDrowseSaeDictionary: clearDrowseSaeMock,
+  setDrowseJlensDictionary: setDrowseJlensMock,
+  clearDrowseJlensDictionary: clearDrowseJlensMock,
+  resolveDrowseJlensTokenDirections: resolveDrowseJlensMock,
+  readDrowseJlensTopTokens: readDrowseJlensTopMock,
+  readDrowseSaeTopFeatures: readDrowseSaeTopMock,
 };
 
 jest.mock("../src/engine", () => {
@@ -43,6 +82,24 @@ beforeEach(() => {
   embeddingMock.mockClear();
   setLogitRegistryMock.mockClear();
   setAppConfigMock.mockClear();
+  supportsDrowseMock.mockClear();
+  setDrowseMock.mockClear();
+  clearDrowseMock.mockClear();
+  readDrowseMock.mockClear();
+  supportsDrowseCaptureMock.mockClear();
+  captureDrowseMock.mockClear();
+  prepareDrowseCaptureMock.mockClear();
+  drowseCapabilitiesMock.mockClear();
+  drowseProfileMock.mockClear();
+  tokenizeDrowseMock.mockClear();
+  decodeDrowseMock.mockClear();
+  setDrowseSaeMock.mockClear();
+  clearDrowseSaeMock.mockClear();
+  setDrowseJlensMock.mockClear();
+  clearDrowseJlensMock.mockClear();
+  resolveDrowseJlensMock.mockClear();
+  readDrowseJlensTopMock.mockClear();
+  readDrowseSaeTopMock.mockClear();
   mockEngineInstance.__initCb = undefined;
   (globalThis as any).postMessage = jest.fn();
 });
@@ -63,6 +120,138 @@ test("constructor registers init progress callback and posts updates", () => {
   });
   // suppress unused
   expect(handler).toBeTruthy();
+});
+
+test("constructor accepts a caller-configured engine", () => {
+  const suppliedEngine = {
+    ...mockEngineInstance,
+    setInitProgressCallback: jest.fn(),
+  };
+  const handler = new WebWorkerMLCEngineHandler(suppliedEngine as any);
+  expect(handler.engine).toBe(suppliedEngine);
+  expect(suppliedEngine.setInitProgressCallback).toHaveBeenCalled();
+});
+
+test("worker errors retain nested WebGPU diagnostics", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  setDrowseMock.mockRejectedValueOnce({
+    error: {
+      name: "GPUOutOfMemoryError",
+      message: "allocation exceeded the device limit",
+    },
+    reason: "out-of-memory",
+  });
+  handler.onmessage({
+    kind: "setDrowseStructuredProgram",
+    uuid: "structured-error",
+    content: { program: {}, modelId: "demo" },
+  });
+  await flushMicrotasks();
+  expect(globalThis.postMessage).toHaveBeenCalledWith({
+    kind: "throw",
+    uuid: "structured-error",
+    content: expect.stringContaining(
+      "GPUOutOfMemoryError: allocation exceeded the device limit",
+    ),
+  });
+});
+
+test("residual capture messages return typed capture data", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  const capture = {
+    layerCount: 2,
+    positionCount: 1,
+    hiddenSize: 2,
+    positions: [3],
+    values: Float32Array.from([1, 2, 3, 4]),
+  };
+  captureDrowseMock.mockResolvedValueOnce(capture);
+  const onComplete = jest.fn();
+  handler.onmessage(
+    {
+      kind: "captureDrowseResiduals",
+      uuid: "capture-1",
+      content: { inputIds: [4, 5, 6, 7], positions: [3], modelId: "demo" },
+    },
+    onComplete,
+  );
+  await flushMicrotasks();
+  expect(captureDrowseMock).toHaveBeenCalledWith([4, 5, 6, 7], [3], "demo");
+  expect(onComplete).toHaveBeenCalledWith(capture);
+});
+
+test("capture row preparation messages route through the worker", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  const prepared = [{ inputIds: [1, 2, 3], position: 1 }];
+  prepareDrowseCaptureMock.mockResolvedValueOnce(prepared);
+  const rows = [
+    {
+      system: "brief",
+      messages: [{ role: "assistant", content: "response" }],
+    },
+  ];
+  const onComplete = jest.fn();
+  handler.onmessage(
+    {
+      kind: "prepareDrowseCaptureRows",
+      uuid: "prepare-1",
+      content: { rows, specialTokenIds: [3], modelId: "demo" },
+    },
+    onComplete,
+  );
+  await flushMicrotasks();
+  expect(prepareDrowseCaptureMock).toHaveBeenCalledWith(rows, [3], "demo");
+  expect(onComplete).toHaveBeenCalledWith(prepared);
+});
+
+test("Drowse capability and tokenizer messages route through the worker", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  const capabilities = {
+    topK: true,
+    forcedReplay: true,
+    replayScoring: true,
+    tokenizer: true,
+    namedRoles: false,
+    userSeatGeneration: true,
+    sceneStitching: true,
+  };
+  drowseCapabilitiesMock.mockResolvedValueOnce(capabilities);
+  tokenizeDrowseMock.mockResolvedValueOnce([31, 32]);
+  decodeDrowseMock.mockResolvedValueOnce(" leading");
+  const complete = jest.fn();
+
+  handler.onmessage(
+    {
+      kind: "getDrowseRuntimeCapabilities",
+      uuid: "capabilities",
+      content: { modelId: "demo" },
+    } as any,
+    complete,
+  );
+  handler.onmessage(
+    {
+      kind: "tokenizeDrowseText",
+      uuid: "tokenize",
+      content: { text: " leading", modelId: "demo" },
+    } as any,
+    complete,
+  );
+  handler.onmessage(
+    {
+      kind: "decodeDrowseTokens",
+      uuid: "decode",
+      content: { tokenIds: [31, 32], modelId: "demo" },
+    } as any,
+    complete,
+  );
+  await flushMicrotasks();
+
+  expect(drowseCapabilitiesMock).toHaveBeenCalledWith("demo");
+  expect(tokenizeDrowseMock).toHaveBeenCalledWith(" leading", "demo");
+  expect(decodeDrowseMock).toHaveBeenCalledWith([31, 32], "demo");
+  expect(complete).toHaveBeenCalledWith(capabilities);
+  expect(complete).toHaveBeenCalledWith([31, 32]);
+  expect(complete).toHaveBeenCalledWith(" leading");
 });
 
 test("chatCompletionNonStreaming reloads when worker state mismatches", async () => {
@@ -325,4 +514,295 @@ test("WebWorkerMLCEngine info helpers resolve via worker messages", async () => 
   expect(worker.sent.some((msg) => msg.kind === "interruptGenerate")).toBe(
     true,
   );
+});
+
+test("Drowse worker handler routes program and measurement operations", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  const hookProgram = { enabled: Uint32Array.from([1]) } as any;
+  supportsDrowseMock.mockResolvedValueOnce(true);
+  setDrowseMock.mockResolvedValueOnce(undefined);
+  clearDrowseMock.mockResolvedValueOnce(undefined);
+  readDrowseMock.mockResolvedValueOnce(Float32Array.from([0.5]));
+
+  handler.onmessage({
+    kind: "supportsDrowseRankOneHooks",
+    uuid: "supports",
+    content: { modelId: "demo" },
+  } as any);
+  handler.onmessage({
+    kind: "setDrowseRankOneProgram",
+    uuid: "set",
+    content: { modelId: "demo", program: hookProgram },
+  } as any);
+  handler.onmessage({
+    kind: "clearDrowseRankOneProgram",
+    uuid: "clear",
+    content: { modelId: "demo" },
+  } as any);
+  handler.onmessage({
+    kind: "readDrowseMeasurements",
+    uuid: "read",
+    content: { modelId: "demo" },
+  } as any);
+  await flushMicrotasks();
+
+  expect(supportsDrowseMock).toHaveBeenCalledWith("demo");
+  expect(setDrowseMock).toHaveBeenCalledWith(hookProgram, "demo");
+  expect(clearDrowseMock).toHaveBeenCalledWith("demo");
+  expect(readDrowseMock).toHaveBeenCalledWith("demo");
+});
+
+test("Drowse worker handler routes exact precomputed readout operations", async () => {
+  const handler = new WebWorkerMLCEngineHandler();
+  const dictionary = {
+    hookAbi: "post-block-residual-v4",
+    bindingId: "a".repeat(64),
+    hiddenSize: 2,
+    runtimeLayerIndex: 1,
+    featureCount: 2,
+    encoder: Float32Array.from([1, 0, 0, 1]),
+    encoderBias: new Float32Array(2),
+    decoderBias: new Float32Array(2),
+  };
+  const jlensDictionary = {
+    hookAbi: "post-block-residual-v4",
+    bindingId: "b".repeat(64),
+    hiddenSize: 2,
+    layerIndices: Int32Array.of(1),
+    matrices: [new Float32Array(4)],
+  };
+  const jlens = {
+    tokenIds: Int32Array.from([7, 6, 5, 4, 3, 2, 1, 0]),
+    strength: new Float32Array(8),
+    centerOfMass: new Float32Array(8),
+    spread: new Float32Array(8),
+    fittedLayerCount: 1,
+    layerIndices: Int32Array.of(1),
+    layerTokenIds: Int32Array.from([7, 6, 5, 4, 3, 2, 1, 0]),
+    layerProbabilities: new Float32Array(8),
+  };
+  const sae = {
+    featureIds: Int32Array.from([1, 0]),
+    activations: Float32Array.from([0.75, 0.25]),
+    runtimeLayerIndex: 1,
+    featureCount: 2,
+  };
+  setDrowseSaeMock.mockResolvedValueOnce(undefined);
+  clearDrowseSaeMock.mockResolvedValueOnce(undefined);
+  setDrowseJlensMock.mockResolvedValueOnce(undefined);
+  clearDrowseJlensMock.mockResolvedValueOnce(undefined);
+  resolveDrowseJlensMock.mockResolvedValueOnce(Float32Array.from([1, 2]));
+  readDrowseJlensTopMock.mockResolvedValueOnce(jlens);
+  readDrowseSaeTopMock.mockResolvedValueOnce(sae);
+  const complete = jest.fn();
+
+  for (const message of [
+    {
+      kind: "setDrowseSaeDictionary",
+      uuid: "set-sae",
+      content: { modelId: "demo", dictionary },
+    },
+    {
+      kind: "clearDrowseSaeDictionary",
+      uuid: "clear-sae",
+      content: { modelId: "demo" },
+    },
+    {
+      kind: "setDrowseJlensDictionary",
+      uuid: "set-jlens",
+      content: { modelId: "demo", dictionary: jlensDictionary },
+    },
+    {
+      kind: "clearDrowseJlensDictionary",
+      uuid: "clear-jlens",
+      content: { modelId: "demo" },
+    },
+    {
+      kind: "resolveDrowseJlensTokenDirections",
+      uuid: "resolve-jlens",
+      content: {
+        modelId: "demo",
+        bindingId: jlensDictionary.bindingId,
+        layerIndices: [1],
+        tokenIds: [7],
+      },
+    },
+    {
+      kind: "readDrowseJlensTopTokens",
+      uuid: "read-jlens",
+      content: { modelId: "demo" },
+    },
+    {
+      kind: "readDrowseSaeTopFeatures",
+      uuid: "read-sae",
+      content: { modelId: "demo" },
+    },
+  ]) {
+    handler.onmessage(message as any, complete);
+  }
+  await flushMicrotasks();
+
+  expect(setDrowseSaeMock).toHaveBeenCalledWith(dictionary, "demo");
+  expect(clearDrowseSaeMock).toHaveBeenCalledWith("demo");
+  expect(setDrowseJlensMock).toHaveBeenCalledWith(jlensDictionary, "demo");
+  expect(clearDrowseJlensMock).toHaveBeenCalledWith("demo");
+  expect(resolveDrowseJlensMock).toHaveBeenCalledWith(
+    jlensDictionary.bindingId,
+    [1],
+    [7],
+    "demo",
+  );
+  expect(readDrowseJlensTopMock).toHaveBeenCalledWith("demo");
+  expect(readDrowseSaeTopMock).toHaveBeenCalledWith("demo");
+  expect(complete).toHaveBeenCalledWith(jlens);
+  expect(complete).toHaveBeenCalledWith(sae);
+});
+
+test("WebWorkerMLCEngine exposes Drowse program operations", async () => {
+  const worker = new MockWorker();
+  const hookProgram = { enabled: Uint32Array.from([1]) } as any;
+  worker.setResponder("supportsDrowseRankOneHooks", () => true);
+  worker.setResponder("setDrowseRankOneProgram", () => null);
+  worker.setResponder("clearDrowseRankOneProgram", () => null);
+  worker.setResponder("readDrowseMeasurements", () =>
+    Float32Array.from([0.25]),
+  );
+  const engine = new WebWorkerMLCEngine(worker as any);
+
+  await expect(engine.supportsDrowseRankOneHooks("demo")).resolves.toBe(true);
+  await engine.setDrowseRankOneProgram(hookProgram, "demo");
+  await engine.clearDrowseRankOneProgram("demo");
+  await expect(engine.readDrowseMeasurements("demo")).resolves.toEqual(
+    Float32Array.from([0.25]),
+  );
+  expect(
+    worker.sent.filter((message) => message.kind.includes("Drowse")),
+  ).toHaveLength(4);
+});
+
+test("WebWorkerMLCEngine exposes exact precomputed readout operations", async () => {
+  const worker = new MockWorker();
+  const dictionary = {
+    hookAbi: "post-block-residual-v4",
+    bindingId: "a".repeat(64),
+    hiddenSize: 2,
+    runtimeLayerIndex: 1,
+    featureCount: 2,
+    encoder: Float32Array.from([1, 0, 0, 1]),
+    encoderBias: new Float32Array(2),
+    decoderBias: new Float32Array(2),
+  } as any;
+  const jlensDictionary = {
+    hookAbi: "post-block-residual-v4",
+    bindingId: "b".repeat(64),
+    hiddenSize: 2,
+    layerIndices: Int32Array.of(1),
+    matrices: [new Float32Array(4)],
+  } as any;
+  const jlens = {
+    tokenIds: new Int32Array(8),
+    strength: new Float32Array(8),
+    centerOfMass: new Float32Array(8),
+    spread: new Float32Array(8),
+    fittedLayerCount: 1,
+    layerIndices: Int32Array.of(1),
+    layerTokenIds: new Int32Array(8),
+    layerProbabilities: new Float32Array(8),
+  };
+  const sae = {
+    featureIds: Int32Array.from([1, 0]),
+    activations: Float32Array.from([0.75, 0.25]),
+    runtimeLayerIndex: 1,
+    featureCount: 2,
+  };
+  worker.setResponder("setDrowseSaeDictionary", () => null);
+  worker.setResponder("clearDrowseSaeDictionary", () => null);
+  worker.setResponder("setDrowseJlensDictionary", () => null);
+  worker.setResponder("clearDrowseJlensDictionary", () => null);
+  worker.setResponder("resolveDrowseJlensTokenDirections", () =>
+    Float32Array.from([1, 2]),
+  );
+  worker.setResponder("readDrowseJlensTopTokens", () => jlens);
+  worker.setResponder("readDrowseSaeTopFeatures", () => sae);
+  const engine = new WebWorkerMLCEngine(worker as any);
+
+  await engine.setDrowseSaeDictionary(dictionary, "demo");
+  await engine.setDrowseJlensDictionary(jlensDictionary, "demo");
+  await expect(
+    engine.resolveDrowseJlensTokenDirections(
+      jlensDictionary.bindingId,
+      [1],
+      [7],
+      "demo",
+    ),
+  ).resolves.toEqual(Float32Array.from([1, 2]));
+  await expect(engine.readDrowseJlensTopTokens("demo")).resolves.toEqual(jlens);
+  await expect(engine.readDrowseSaeTopFeatures("demo")).resolves.toEqual(sae);
+  await engine.clearDrowseSaeDictionary("demo");
+  await engine.clearDrowseJlensDictionary("demo");
+  expect(
+    worker.sent
+      .filter((message) =>
+        [
+          "setDrowseSaeDictionary",
+          "setDrowseJlensDictionary",
+          "resolveDrowseJlensTokenDirections",
+          "readDrowseJlensTopTokens",
+          "readDrowseSaeTopFeatures",
+          "clearDrowseSaeDictionary",
+          "clearDrowseJlensDictionary",
+        ].includes(message.kind),
+      )
+      .map(({ kind }) => kind),
+  ).toEqual([
+    "setDrowseSaeDictionary",
+    "setDrowseJlensDictionary",
+    "resolveDrowseJlensTokenDirections",
+    "readDrowseJlensTopTokens",
+    "readDrowseSaeTopFeatures",
+    "clearDrowseSaeDictionary",
+    "clearDrowseJlensDictionary",
+  ]);
+  expect(
+    worker.sent.find((message) => message.kind === "setDrowseSaeDictionary")
+      ?.content,
+  ).toEqual({ dictionary, modelId: "demo" });
+});
+
+test("WebWorkerMLCEngine exposes Drowse capabilities and tokenizer", async () => {
+  const worker = new MockWorker();
+  const capabilities = {
+    topK: true,
+    forcedReplay: true,
+    replayScoring: true,
+    tokenizer: true,
+    namedRoles: true,
+    userSeatGeneration: true,
+    sceneStitching: true,
+  };
+  const profile = { schemaVersion: 1, id: "standard-v1" };
+  worker.setResponder("getDrowseRuntimeCapabilities", () => capabilities);
+  worker.setResponder("getDrowseStructuredHookProfile", () => profile);
+  worker.setResponder("tokenizeDrowseText", () => [31, 32]);
+  worker.setResponder("decodeDrowseTokens", () => " leading");
+  const engine = new WebWorkerMLCEngine(worker as any);
+
+  await expect(engine.getDrowseRuntimeCapabilities("demo")).resolves.toEqual(
+    capabilities,
+  );
+  await expect(engine.getDrowseStructuredHookProfile("demo")).resolves.toEqual(
+    profile,
+  );
+  await expect(engine.tokenizeDrowseText(" leading", "demo")).resolves.toEqual([
+    31, 32,
+  ]);
+  await expect(engine.decodeDrowseTokens([31, 32], "demo")).resolves.toBe(
+    " leading",
+  );
+  expect(worker.sent.slice(-4).map((message) => message.kind)).toEqual([
+    "getDrowseRuntimeCapabilities",
+    "getDrowseStructuredHookProfile",
+    "tokenizeDrowseText",
+    "decodeDrowseTokens",
+  ]);
 });

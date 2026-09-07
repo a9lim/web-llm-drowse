@@ -1,3 +1,5 @@
+/// <reference types="@webgpu/types" />
+
 import log from "loglevel";
 import { ResponseFormat } from "./openai_api_protocols";
 import { LogitProcessor, InitProgressCallback, LogLevel } from "./types";
@@ -9,6 +11,7 @@ import {
   RangeError,
 } from "./error";
 import { ModelIntegrity } from "./integrity";
+import type { ArtifactCacheTemplate } from "@mlc-ai/web-runtime";
 
 /**
  * Conversation template config
@@ -105,6 +108,7 @@ export interface ChatConfig {
   top_p: number;
   temperature: number;
   bos_token_id?: number;
+  drowse_completion_prefix_token_ids?: number[];
   // Model type identifier from mlc-chat-config.json (e.g. "phi3_v", "gemma3_v")
   model_type?: string;
   // Nested model config from mlc-chat-config.json, contains model-specific parameters
@@ -149,6 +153,7 @@ export interface GenerationConfig {
   ignore_eos?: boolean;
   // Shared by MLC and OpenAI APIs
   top_p?: number | null;
+  top_k?: number | null;
   temperature?: number | null;
   // Only in OpenAI APIs
   max_tokens?: number | null;
@@ -163,6 +168,10 @@ export interface GenerationConfig {
   // extra_body in ChatCompletionsRequest
   enable_thinking?: boolean | null;
   enable_latency_breakdown?: boolean | null;
+  drowse_generation_role?: string | null;
+  drowse_generation_seat?: "user" | "assistant" | null;
+  drowse_forced_prefix_token_ids?: number[] | null;
+  drowse_score_token_ids?: number[] | null;
 }
 
 export function postInitAndCheckGenerationConfigValues(
@@ -171,6 +180,34 @@ export function postInitAndCheckGenerationConfigValues(
   function _hasValue(value: any): boolean {
     // if we use `if value` directly, `value` being 0 evaluates to false, violating semantics
     return value !== undefined && value !== null;
+  }
+  if (
+    _hasValue(config.drowse_generation_role) &&
+    (typeof config.drowse_generation_role !== "string" ||
+      !/^[a-z0-9._-]+$/.test(config.drowse_generation_role))
+  ) {
+    throw new TypeError("drowse_generation_role must be a lowercase role slug");
+  }
+  if (
+    _hasValue(config.drowse_generation_seat) &&
+    config.drowse_generation_seat !== "user" &&
+    config.drowse_generation_seat !== "assistant"
+  ) {
+    throw new TypeError("drowse_generation_seat must be `user` or `assistant`");
+  }
+  for (const [name, tokenIds] of [
+    ["drowse_forced_prefix_token_ids", config.drowse_forced_prefix_token_ids],
+    ["drowse_score_token_ids", config.drowse_score_token_ids],
+  ] as const) {
+    if (
+      _hasValue(tokenIds) &&
+      (!Array.isArray(tokenIds) ||
+        tokenIds.some(
+          (tokenId) => !Number.isSafeInteger(tokenId) || tokenId < 0,
+        ))
+    ) {
+      throw new TypeError(`${name} must contain non-negative token IDs`);
+    }
   }
   if (
     _hasValue(config.frequency_penalty) &&
@@ -193,11 +230,27 @@ export function postInitAndCheckGenerationConfigValues(
   if (_hasValue(config.max_tokens) && !(config.max_tokens! > 0)) {
     throw new MinValueError("max_tokens", 0);
   }
-  if (_hasValue(config.top_p) && !(config.top_p! > 0 && config.top_p! <= 1)) {
+  if (
+    _hasValue(config.top_p) &&
+    (typeof config.top_p !== "number" ||
+      !Number.isFinite(config.top_p) ||
+      config.top_p < 0 ||
+      config.top_p > 1)
+  ) {
     throw new RangeError("top_p", 0, 1);
   }
-  if (_hasValue(config.temperature) && !(config.temperature! >= 0)) {
-    throw new NonNegativeError("temperature");
+  if (
+    _hasValue(config.top_k) &&
+    (!Number.isSafeInteger(config.top_k) || config.top_k! < 0)
+  ) {
+    throw new NonNegativeError("top_k");
+  }
+  if (
+    _hasValue(config.temperature) &&
+    (typeof config.temperature !== "number" ||
+      !Number.isFinite(config.temperature))
+  ) {
+    throw new TypeError("temperature must be finite");
   }
   // If only one of frequency or presence penatly is set, make the other one 0.0
   if (
@@ -309,6 +362,14 @@ export interface ModelRecord {
  * - "sync": require OPFS sync access handles.
  * - "auto": use sync access handles when available and fall back to async OPFS otherwise.
  *
+ * @param artifactCache: optional caller-owned artifact source. When supplied, all model,
+ * tokenizer, configuration, WASM, and tensor-cache reads use it instead of WebLLM's cache.
+ * This value is not structured-cloneable and is intended for direct MLCEngine instances.
+ *
+ * @param gpuAdapter: optional adapter selected by the caller's compatibility gate. A production
+ * device is requested from this exact adapter instead of selecting another adapter during load.
+ * @param onDeviceLost: optional direct-engine callback for unexpected WebGPU device loss.
+ *
  * @note Note that the Cache API is the most well-tested in WebLLM as of now.
  */
 export type CacheBackend = "cache" | "indexeddb" | "cross-origin" | "opfs";
@@ -318,6 +379,9 @@ export interface AppConfig {
   model_list: Array<ModelRecord>;
   cacheBackend?: CacheBackend;
   opfsAccessMode?: OPFSAccessMode;
+  artifactCache?: ArtifactCacheTemplate;
+  gpuAdapter?: GPUAdapter;
+  onDeviceLost?: (info: GPUDeviceLostInfo) => void;
 }
 
 export function getCacheBackend(appConfig: AppConfig): CacheBackend {

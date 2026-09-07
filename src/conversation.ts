@@ -25,6 +25,34 @@ import {
 } from "./error";
 
 type ImageURL = ChatCompletionContentPartImage.ImageURL;
+const DROWSE_SYSTEM_ROLE = "drowse_system" as const;
+type ConversationRole = Role | typeof DROWSE_SYSTEM_ROLE;
+
+function drowseRoleHeader(
+  standard: string,
+  role: Role,
+  roleName?: string,
+  strict = true,
+): string {
+  if (roleName === undefined) return standard;
+  const rendered = roleName.replaceAll("_", " ");
+  const labels = role === Role.assistant ? ["assistant", "model"] : ["user"];
+  for (const prefix of [
+    "<|im_start|>",
+    "<start_of_turn>",
+    "<|start_header_id|>",
+  ]) {
+    for (const label of labels) {
+      if (standard === `${prefix}${label}`) {
+        return `${prefix}${rendered}`;
+      }
+    }
+  }
+  if (!strict) return roleName;
+  throw new Error(
+    `Drowse named ${role} headers require a supported role-prefixed conversation template`,
+  );
+}
 
 /**
  * Helper to keep track of history conversations.
@@ -35,7 +63,11 @@ export class Conversation {
    *  string or an array of contentPart for possible image input.
    */
   public messages: Array<
-    [Role, string, string | Array<ChatCompletionContentPart> | undefined]
+    [
+      ConversationRole,
+      string,
+      string | Array<ChatCompletionContentPart> | undefined,
+    ]
   > = [];
   readonly config: ConvTemplateConfig;
 
@@ -92,6 +124,21 @@ export class Conversation {
       const role = item[0];
       const role_str = item[1];
       const messageContent = item[2];
+
+      if (role === DROWSE_SYSTEM_ROLE) {
+        if (typeof messageContent !== "string") {
+          throw new TypeError(
+            "Drowse system capture messages must contain text",
+          );
+        }
+        ret.push(
+          this.config.system_template.replace(
+            MessagePlaceholders.system,
+            messageContent,
+          ),
+        );
+        continue;
+      }
 
       // 1. Message from `appendReplyHeader()`, message is empty; not much processing is needed.
       if (messageContent === undefined) {
@@ -299,10 +346,56 @@ export class Conversation {
     return this.config.stop_token_ids;
   }
 
+  supportsDrowseNamedRoles(): boolean {
+    try {
+      drowseRoleHeader(this.config.roles[Role.user], Role.user, "named_user");
+      drowseRoleHeader(
+        this.config.roles[Role.assistant],
+        Role.assistant,
+        "named_assistant",
+      );
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  supportsDrowseUserSeatGeneration(): boolean {
+    return (
+      typeof this.config.roles[Role.user] === "string" &&
+      typeof this.config.roles[Role.assistant] === "string"
+    );
+  }
+
+  appendDrowseSystemMessage(message: string) {
+    if (this.isTextCompletion) {
+      throw new TextCompletionConversationError("appendDrowseSystemMessage");
+    }
+    if (
+      this.messages.length != 0 &&
+      this.messages[this.messages.length - 1][2] == undefined
+    ) {
+      throw Error("Have unfinished reply");
+    }
+    const separator = this.config.seps[0];
+    if (
+      typeof message !== "string" ||
+      this.config.seps.length !== 1 ||
+      !separator ||
+      !this.config.system_template.endsWith(separator)
+    ) {
+      throw new TypeError(
+        "Drowse ordered system capture requires a single-separator system template",
+      );
+    }
+    this.messages.push([DROWSE_SYSTEM_ROLE, "", message]);
+  }
+
   appendMessage(
     role: Role,
     message: string | Array<ChatCompletionContentPart>,
     role_name?: string,
+    strict_named_role = false,
   ) {
     if (this.isTextCompletion) {
       throw new TextCompletionConversationError("appendMessage");
@@ -316,28 +409,47 @@ export class Conversation {
     if (!(role in this.config.roles)) {
       throw Error("Role is not supported: " + role);
     }
-    const role_name_str = role_name ? role_name : this.config.roles[role];
+    const role_name_str = drowseRoleHeader(
+      this.config.roles[role],
+      role,
+      role_name,
+      strict_named_role,
+    );
     this.messages.push([role, role_name_str, message]);
   }
 
-  appendReplyHeader(role: Role) {
+  appendReplyHeader(role: Role, role_name?: string) {
     if (this.isTextCompletion) {
       throw new TextCompletionConversationError("appendReplyHeader");
     }
     if (!(role in this.config.roles)) {
       throw Error("Role is not supported: " + role);
     }
-    this.messages.push([role, this.config.roles[role], undefined]);
+    const role_name_str = drowseRoleHeader(
+      this.config.roles[role],
+      role,
+      role_name,
+    );
+    this.messages.push([role, role_name_str, undefined]);
   }
 
-  appendEmptyThinkingReplyHeader(role: Role, emptyThinkingBlockStr: string) {
+  appendEmptyThinkingReplyHeader(
+    role: Role,
+    emptyThinkingBlockStr: string,
+    role_name?: string,
+  ) {
     if (this.isTextCompletion) {
       throw new TextCompletionConversationError(
         "appendEmptyThinkingReplyHeader",
       );
     }
     this.isLastMessageEmptyThinkingReplyHeader = true;
-    this.messages.push([role, this.config.roles[role], emptyThinkingBlockStr]);
+    const role_name_str = drowseRoleHeader(
+      this.config.roles[role],
+      role,
+      role_name,
+    );
+    this.messages.push([role, role_name_str, emptyThinkingBlockStr]);
   }
 
   finishReply(message: string) {
@@ -488,9 +600,17 @@ export function getConversationFromChatCompletionRequest(
   // 2. Populate conversation.messages
   const input = request.messages;
   const lastId = input.length - 1;
-  if (input[lastId].role !== "user" && input[lastId].role !== "tool") {
+  const generationSeat =
+    request.extra_body?.drowse_generation_seat ?? "assistant";
+  const validLastRole =
+    generationSeat === "user"
+      ? input[lastId].role === "assistant"
+      : input[lastId].role === "user" || input[lastId].role === "tool";
+  if (!validLastRole) {
     throw new MessageOrderError(
-      "The last message should be from the `user` or `tool`.",
+      generationSeat === "user"
+        ? "The last message should be from the `assistant` when generating the user seat."
+        : "The last message should be from the `user` or `tool`.",
     );
   }
   const iterEnd = includeLastMsg ? input.length : input.length - 1;
