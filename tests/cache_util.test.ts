@@ -107,6 +107,23 @@ test("cache option helpers include scope only for tensor cache access", () => {
   });
 });
 
+test("cache option helpers preserve a caller-owned artifact cache", () => {
+  const artifactCache = {} as tvmMockImport.ArtifactCacheTemplate;
+  const appConfig: AppConfig = {
+    ...baseAppConfig,
+    artifactCache,
+  };
+  expect(getCacheOptions(appConfig)).toEqual({
+    cacheType: "cache",
+    artifactCache,
+  });
+  expect(getTensorCacheAccessOptions("webllm/model", appConfig)).toEqual({
+    cacheScope: "webllm/model",
+    cacheType: "cache",
+    artifactCache,
+  });
+});
+
 test("deleteModelInCache clears tensors and tokenizer assets for indexeddb cache", async () => {
   const indexedConfig: AppConfig = {
     ...baseAppConfig,

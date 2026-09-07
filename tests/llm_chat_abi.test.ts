@@ -28,6 +28,25 @@ function makeFakeTensor(seqLen: number) {
   return tensor;
 }
 
+test("legacy compiled hook names alias to Drowse without replacing current kernels", () => {
+  const applyAliases = (LLMChatPipeline as AnyObj).applyLegacyDrowseAliases;
+  const legacyPrefill = jest.fn();
+  const currentDecode = jest.fn();
+  const legacyDecode = jest.fn();
+  const registry: AnyObj = {
+    saklas_structured_batch_prefill: legacyPrefill,
+    drowse_structured_batch_decode: currentDecode,
+    saklas_structured_batch_decode: legacyDecode,
+    unrelated: jest.fn(),
+  };
+
+  applyAliases(registry);
+
+  expect(registry.drowse_structured_batch_prefill).toBe(legacyPrefill);
+  expect(registry.drowse_structured_batch_decode).toBe(currentDecode);
+  expect(registry.drowse_unrelated).toBeUndefined();
+});
+
 test("parseKVStateKind defaults missing metadata to kv_cache", () => {
   const pipeline = Object.create(LLMChatPipeline.prototype) as AnyObj;
   expect(pipeline.parseKVStateKind(undefined)).toBe("kv_cache");
@@ -237,4 +256,60 @@ test("embedAndForward begins and ends forward for all active states", async () =
   );
   expect(pipeline.fKVCacheEndForward).toHaveBeenNthCalledWith(1, rnnState);
   expect(pipeline.fKVCacheEndForward).toHaveBeenNthCalledWith(2, kvState);
+});
+
+test("rank-one forward does not read the structured hidden-state tuple slot", async () => {
+  const pipeline = Object.create(LLMChatPipeline.prototype) as AnyObj;
+  const kvState = { id: "kv" };
+  const logits = { value: "logits" };
+  const measurements = { value: "measurements" };
+  const retValue = {
+    get: jest.fn((index: number) => {
+      if (index === 0) return logits;
+      if (index === 2) return measurements;
+      throw new Error(`Index ${index} out of bounds 3`);
+    }),
+  };
+
+  pipeline.prefillChunkSize = 1024;
+  pipeline.resolvedModelABI = {
+    kvStateKind: "kv_cache",
+    prefillABI: "batch",
+    decodeABI: "batch",
+    prefillFunctionName: "batch_prefill",
+    decodeFunctionName: "batch_decode",
+    needsKVCache: true,
+    needsRNNState: false,
+  };
+  pipeline.kvCache = kvState;
+  pipeline.params = { kind: "params" };
+  pipeline.filledKVCacheLength = 0;
+  pipeline.drowseProgram = {
+    enabled: {},
+    basis: {},
+    neutral: {},
+    target: {},
+    along: {},
+    collapse: {},
+    probeBasis: {},
+    probeNeutral: {},
+  };
+  pipeline.drowseDecoding = jest.fn(() => retValue);
+  pipeline.tvm = {
+    beginScope: jest.fn(),
+    endScope: jest.fn(),
+    makeShapeTuple: jest.fn((x: number[]) => x),
+    concatEmbeddings: jest.fn(),
+    detachFromCurrentScope: jest.fn((x: any) => x),
+    attachToCurrentScope: jest.fn(),
+  };
+  pipeline.fKVCacheBeginForward = jest.fn();
+  pipeline.fKVCacheEndForward = jest.fn();
+  pipeline.getTokensEmbeddings = jest.fn(() => makeFakeTensor(1));
+  pipeline.getImageEmbeddings = jest.fn();
+
+  await expect(pipeline.embedAndForward([[101]], 1)).resolves.toBe(logits);
+  expect(retValue.get).toHaveBeenCalledWith(2);
+  expect(retValue.get).toHaveBeenCalledWith(0);
+  expect(retValue.get).not.toHaveBeenCalledWith(3);
 });

@@ -1,6 +1,6 @@
 {
-  "name": "@mlc-ai/web-llm",
-  "version": "0.2.84",
+  "name": "@drowse/web-llm",
+  "version": "0.2.84-drowse.34",
   "description": "Hardware accelerated language model chats on browsers",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
@@ -17,7 +17,7 @@
   ],
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/mlc-ai/web-llm"
+    "url": "git+https://github.com/a9lim/web-llm-polythetic"
   },
   "keywords": [
     "llm",
@@ -25,12 +25,12 @@
     "machine learning"
   ],
   "license": "Apache-2.0",
-  "homepage": "https://github.com/mlc-ai/web-llm",
+  "homepage": "https://github.com/a9lim/web-llm-polythetic",
   "devDependencies": {
     "@eslint/eslintrc": "^3.3.1",
     "@eslint/js": "^9.9.0",
-    "@mlc-ai/web-runtime": "^0.26.0-dev0",
-    "@mlc-ai/web-tokenizers": "^0.1.6",
+    "@mlc-ai/web-runtime": "0.26.0-dev0",
+    "@mlc-ai/web-tokenizers": "0.1.6",
     "@mlc-ai/web-xgrammar": "0.1.27",
     "@next/eslint-plugin-next": "^16.0.0",
     "@rollup/plugin-commonjs": "^29.0.0",
@@ -56,10 +56,14 @@
     "typescript-eslint": "^8.47.0"
   },
   "dependencies": {
-    "loglevel": "^1.9.1"
+    "loglevel": "1.9.2"
   },
   "overrides": {
     "test-exclude": "^7.0.1",
-    "glob": "^13.0.0"
+    "glob": "^13.0.0",
+    "fix": {
+      "underscore": "1.13.8",
+      "underscore.string": "3.3.6"
+    }
   }
 }

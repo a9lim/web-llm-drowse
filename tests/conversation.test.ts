@@ -53,6 +53,72 @@ describe("Test basic conversation loading and getPromptArray", () => {
 });
 
 describe("Test getConversationFromChatCompletionRequest with Qwen3", () => {
+  test("renders named user and assistant history in their original structural seats", () => {
+    const config_json = JSON.parse(qwen3ChatConfigJSONString);
+    const config = { ...config_json } as ChatConfig;
+    const conversation = getConversationFromChatCompletionRequest(
+      {
+        messages: [
+          { role: "user", content: "hello", name: "curious_user" },
+          { role: "assistant", content: "welcome", name: "prior_guide" },
+          { role: "user", content: "continue" },
+        ],
+      },
+      config,
+      true,
+    );
+
+    expect(conversation.getPromptArray().join("")).toEqual(
+      "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n" +
+        "<|im_start|>curious user\nhello<|im_end|>\n" +
+        "<|im_start|>prior guide\nwelcome<|im_end|>\n" +
+        "<|im_start|>user\ncontinue<|im_end|>\n",
+    );
+    expect(conversation.messages.map((message) => message[0])).toEqual([
+      Role.user,
+      Role.assistant,
+      Role.user,
+    ]);
+  });
+
+  test("renders a Drowse assistant reply role without changing the assistant seat", () => {
+    const config_json = JSON.parse(qwen3ChatConfigJSONString);
+    const config = { ...config_json } as ChatConfig;
+    const conversation = getConversation(config.conv_template);
+
+    conversation.appendMessage(Role.user, "hello");
+    conversation.appendReplyHeader(Role.assistant, "someone_happy");
+
+    expect(conversation.getPromptArray().join("")).toEqual(
+      "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n" +
+        "<|im_start|>user\nhello<|im_end|>\n" +
+        "<|im_start|>someone happy\n",
+    );
+    expect(conversation.messages.at(-1)?.[0]).toBe(Role.assistant);
+    expect(conversation.supportsDrowseNamedRoles()).toBe(true);
+    expect(conversation.supportsDrowseUserSeatGeneration()).toBe(true);
+  });
+
+  test("renders a named Qwen user-seat reply after assistant history", () => {
+    const config_json = JSON.parse(qwen3ChatConfigJSONString);
+    const config = { ...config_json } as ChatConfig;
+    const conversation = getConversationFromChatCompletionRequest(
+      {
+        messages: [{ role: "assistant", content: "Where should we go?" }],
+        extra_body: { drowse_generation_seat: "user" },
+      },
+      config,
+      true,
+    );
+
+    conversation.appendReplyHeader(Role.user, "curious_user");
+    expect(conversation.getPromptArray().join("")).toContain(
+      "<|im_start|>assistant\nWhere should we go?<|im_end|>\n" +
+        "<|im_start|>curious user\n",
+    );
+    expect(conversation.messages.at(-1)?.[0]).toBe(Role.user);
+  });
+
   test("Test Qwen3 appendEmptyThinkingReplyHeader", () => {
     const config_json = JSON.parse(qwen3ChatConfigJSONString);
     const config = { ...config_json } as ChatConfig;
@@ -82,6 +148,162 @@ describe("Test getConversationFromChatCompletionRequest with Qwen3", () => {
       message,
     );
   });
+});
+
+describe("Test SmolLM2 Drowse reply role rendering", () => {
+  test("preserves SmolLM2 ChatML markers and de-slugs the generated label", () => {
+    const conversation = getConversation({
+      system_template: "<|im_start|>system\n{system_message}<|im_end|>\n",
+      system_message:
+        "You are a helpful AI assistant named SmolLM, trained by Hugging Face",
+      roles: {
+        user: "<|im_start|>user",
+        assistant: "<|im_start|>assistant",
+        tool: "<|im_start|>tool",
+      },
+      role_templates: {
+        user: "{user_message}",
+        assistant: "{assistant_message}",
+      },
+      role_content_sep: "\n",
+      role_empty_sep: "\n",
+      seps: ["<|im_end|>\n"],
+      stop_str: ["<|im_end|>"],
+      stop_token_ids: [2],
+      add_role_after_system_message: true,
+    });
+
+    conversation.appendMessage(Role.user, "hello");
+    conversation.appendReplyHeader(Role.assistant, "forest_guide");
+
+    expect(conversation.getPromptArray().join("")).toEqual(
+      "<|im_start|>system\n" +
+        "You are a helpful AI assistant named SmolLM, trained by Hugging Face" +
+        "<|im_end|>\n<|im_start|>user\nhello<|im_end|>\n" +
+        "<|im_start|>forest guide\n",
+    );
+    expect(conversation.messages.at(-1)?.[0]).toBe(Role.assistant);
+
+    conversation.finishReply("welcome");
+    conversation.appendReplyHeader(Role.user, "curious_user");
+    expect(conversation.getPromptArray().join("")).toContain(
+      "<|im_start|>forest guide\nwelcome<|im_end|>\n" +
+        "<|im_start|>curious user\n",
+    );
+  });
+
+  test("preserves ordered system turns for activation capture", () => {
+    const conversation = getConversation({
+      system_template: "<|im_start|>system\n{system_message}<|im_end|>\n",
+      system_message: "default",
+      roles: {
+        user: "<|im_start|>user",
+        assistant: "<|im_start|>assistant",
+        tool: "<|im_start|>tool",
+      },
+      role_content_sep: "\n",
+      role_empty_sep: "\n",
+      seps: ["<|im_end|>\n"],
+      stop_str: ["<|im_end|>"],
+      stop_token_ids: [2],
+    });
+    conversation.override_system_message = "directive";
+    conversation.appendMessage(Role.user, "first");
+    conversation.appendDrowseSystemMessage("second system");
+    conversation.appendMessage(Role.assistant, "reply");
+
+    expect(conversation.getPromptArray().join("")).toEqual(
+      "<|im_start|>system\ndirective<|im_end|>\n" +
+        "<|im_start|>user\nfirst<|im_end|>\n" +
+        "<|im_start|>system\nsecond system<|im_end|>\n" +
+        "<|im_start|>assistant\nreply<|im_end|>\n",
+    );
+  });
+
+  test("rejects ordered system turns for templates without an exact system segment", () => {
+    const conversation = getConversation({
+      system_template: "[INST] <<SYS>>\n{system_message}\n<</SYS>>\n\n",
+      system_message: "default",
+      roles: { user: "[INST]", assistant: "[/INST]", tool: "[INST]" },
+      seps: [" "],
+      stop_str: [],
+      stop_token_ids: [],
+    });
+    expect(() => conversation.appendDrowseSystemMessage("later")).toThrow(
+      "requires a single-separator system template",
+    );
+  });
+});
+
+test("Gemma turn templates preserve named Drowse roles", () => {
+  const conversation = getConversation({
+    system_template: "{system_message}",
+    system_message: "",
+    roles: {
+      user: "<start_of_turn>user",
+      assistant: "<start_of_turn>model",
+      tool: "<start_of_turn>tool",
+    },
+    role_templates: {
+      user: "{user_message}",
+      assistant: "{assistant_message}",
+    },
+    role_content_sep: "\n",
+    role_empty_sep: "\n",
+    seps: ["<end_of_turn>\n"],
+    stop_str: ["<end_of_turn>"],
+    stop_token_ids: [1],
+  });
+
+  expect(conversation.supportsDrowseNamedRoles()).toBe(true);
+  conversation.appendMessage(Role.user, "hello");
+  conversation.appendReplyHeader(Role.assistant, "forest_guide");
+  expect(conversation.getPromptArray().join("")).toEqual(
+    "<start_of_turn>user\nhello<end_of_turn>\n" +
+      "<start_of_turn>forest guide\n",
+  );
+});
+
+test("Llama 3 turn templates preserve named Drowse roles", () => {
+  const conversation = getConversation({
+    system_template:
+      "<|start_header_id|>system<|end_header_id|>\n\n{system_message}<|eot_id|>",
+    system_message: "",
+    roles: {
+      user: "<|start_header_id|>user",
+      assistant: "<|start_header_id|>assistant",
+      tool: "<|start_header_id|>ipython",
+    },
+    role_templates: {
+      user: "{user_message}",
+      assistant: "{assistant_message}",
+    },
+    role_content_sep: "<|end_header_id|>\n\n",
+    role_empty_sep: "<|end_header_id|>\n\n",
+    seps: ["<|eot_id|>"],
+    stop_str: [],
+    stop_token_ids: [1],
+  });
+
+  expect(conversation.supportsDrowseNamedRoles()).toBe(true);
+  conversation.appendMessage(Role.user, "hello", "curious_user", true);
+  conversation.appendReplyHeader(Role.assistant, "forest_guide");
+  expect(conversation.getPromptArray().join("")).toEqual(
+    "<|start_header_id|>system<|end_header_id|>\n\n<|eot_id|>" +
+      "<|start_header_id|>curious user<|end_header_id|>\n\nhello<|eot_id|>" +
+      "<|start_header_id|>forest guide<|end_header_id|>\n\n",
+  );
+});
+
+test("non-ChatML templates report named roles unsupported", () => {
+  const config = JSON.parse(llama2ChatConfigJSONString) as ChatConfig;
+  const conversation = getConversation(config.conv_template);
+  expect(conversation.supportsDrowseNamedRoles()).toBe(false);
+  expect(conversation.supportsDrowseUserSeatGeneration()).toBe(true);
+  conversation.appendMessage(Role.user, "hello");
+  expect(() =>
+    conversation.appendReplyHeader(Role.assistant, "named_assistant"),
+  ).toThrow("require a supported role-prefixed conversation template");
 });
 
 describe("Test getConversationFromChatCompletionRequest with image", () => {

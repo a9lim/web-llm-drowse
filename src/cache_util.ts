@@ -14,7 +14,7 @@ import { ModelIntegrity, verifyIntegrity } from "./integrity";
 type CacheScope = "webllm/model" | "webllm/config" | "webllm/wasm";
 type CacheOptions = Pick<
   tvmjs.TensorCacheAccessOptions,
-  "cacheType" | "opfsAccessMode"
+  "cacheType" | "opfsAccessMode" | "artifactCache"
 >;
 
 export function getCacheOptions(appConfig: AppConfig): CacheOptions {
@@ -23,6 +23,9 @@ export function getCacheOptions(appConfig: AppConfig): CacheOptions {
   };
   if (appConfig.opfsAccessMode !== undefined) {
     options.opfsAccessMode = appConfig.opfsAccessMode;
+  }
+  if (appConfig.artifactCache !== undefined) {
+    options.artifactCache = appConfig.artifactCache;
   }
   return options;
 }

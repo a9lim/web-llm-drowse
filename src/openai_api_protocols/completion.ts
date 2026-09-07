@@ -27,6 +27,7 @@ import {
   ChatCompletionStreamOptions,
   CompletionUsage,
   ChatCompletionFinishReason,
+  DrowseGenerationFinishReason,
 } from "./chat_completion";
 
 export class Completions {
@@ -190,6 +191,12 @@ export interface CompletionCreateParamsBase {
   top_p?: number | null;
 
   /**
+   * Limit sampling to the k most likely tokens before applying top-p.
+   * Zero or null leaves the vocabulary uncapped.
+   */
+  top_k?: number | null;
+
+  /**
    * If true, will ignore stop string and stop token and generate until max_tokens hit.
    * If unset, will treat as false.
    */
@@ -242,6 +249,15 @@ export interface CompletionCreateParamsBase {
      * stages of token sampling.
      */
     enable_latency_breakdown?: boolean | null;
+
+    /**
+     * Token IDs emitted for the first N decode steps. Sampling still runs on
+     * every step so the normal RNG stream is preserved.
+     */
+    drowse_forced_prefix_token_ids?: number[] | null;
+
+    /** Token IDs whose exact sampler log probabilities are returned per step. */
+    drowse_score_token_ids?: number[] | null;
   };
 }
 
@@ -318,6 +334,9 @@ export interface CompletionChoice {
    * number of tokens specified in the request was reached.
    */
   finish_reason: ChatCompletionFinishReason | null;
+
+  /** Exact Drowse terminal classification when this choice has stopped. */
+  drowse_finish_reason?: DrowseGenerationFinishReason;
 
   index: number;
 

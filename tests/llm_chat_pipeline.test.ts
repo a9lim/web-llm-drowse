@@ -1,4 +1,4 @@
-import { LLMChatPipeline } from "../src/llm_chat";
+import { LLMChatPipeline, sampleDrowseTopKTopP } from "../src/llm_chat";
 import { MinValueError } from "../src/error";
 import { Role } from "../src/config";
 import { jest, test, expect, beforeEach } from "@jest/globals";
@@ -75,6 +75,96 @@ beforeEach(() => {
   compileStructuralTagMock.mockClear();
 });
 
+test("Drowse sampler applies top-k before top-p and reports compact scores", () => {
+  const result = sampleDrowseTopKTopP(
+    Float32Array.of(0.4, 0.3, 0.2, 0.1),
+    Int32Array.of(10, 11, 12, 13),
+    0.5,
+    2,
+    0.9,
+    [10, 11, 12],
+  );
+  expect(result.sampledTokenId).toBe(10);
+  expect(result.argmax).toEqual({ token_id: 10, logprob: 0 });
+  expect(result.topLogprobs).toEqual([{ token_id: 10, logprob: 0 }]);
+  expect(result.selectedLogprobs).toEqual([
+    { token_id: 10, logprob: 0 },
+    { token_id: 11, logprob: Number.NEGATIVE_INFINITY },
+    { token_id: 12, logprob: Number.NEGATIVE_INFINITY },
+  ]);
+  expect(result.entropyNats).toBe(0);
+  expect(result.perplexity).toBe(1);
+});
+
+test("Drowse sampler reports the exact renormalized nucleus entropy", () => {
+  const result = sampleDrowseTopKTopP(
+    Float32Array.of(0.4, 0.3, 0.2, 0.1),
+    Int32Array.of(10, 11, 12, 13),
+    0.75,
+    3,
+    0.8,
+  );
+  const first = 4 / 7;
+  const second = 3 / 7;
+  const entropy = -(first * Math.log(first) + second * Math.log(second));
+  expect(result.sampledTokenId).toBe(11);
+  expect(result.sampledLogprob).toBeCloseTo(Math.log(second), 6);
+  expect(result.topLogprobs.map((row) => row.token_id)).toEqual([10, 11]);
+  expect(result.topLogprobs[0].logprob).toBeCloseTo(Math.log(first), 6);
+  expect(result.topLogprobs[1].logprob).toBeCloseTo(Math.log(second), 6);
+  expect(result.entropyNats).toBeCloseTo(entropy, 6);
+  expect(result.perplexity).toBeCloseTo(Math.exp(entropy), 6);
+});
+
+test("Drowse top-p zero is an exact deterministic top-one distribution", () => {
+  const result = sampleDrowseTopKTopP(
+    Float32Array.of(0.55, 0.25, 0.2),
+    Int32Array.of(7, 8, 9),
+    0,
+    0,
+    0.999,
+  );
+  expect(result.sampledTokenId).toBe(7);
+  expect(result.sampledLogprob).toBe(0);
+  expect(result.topLogprobs).toEqual([{ token_id: 7, logprob: 0 }]);
+  expect(result.entropyNats).toBe(0);
+  expect(result.perplexity).toBe(1);
+});
+
+test("Drowse unset top-k caps the candidate pool at 1024", () => {
+  const probabilities = new Float32Array(1100).fill(1 / 1100);
+  const result = sampleDrowseTopKTopP(
+    probabilities,
+    Int32Array.from({ length: 1100 }, (_, index) => index),
+    1,
+    0,
+    0.5,
+    [1023, 1024],
+  );
+  expect(result.selectedLogprobs[0].logprob).toBeCloseTo(-Math.log(1024), 5);
+  expect(result.selectedLogprobs[1].logprob).toBe(Number.NEGATIVE_INFINITY);
+  expect(result.entropyNats).toBeCloseTo(Math.log(1024), 5);
+});
+
+test("Drowse sampler uses one supplied RNG draw and caps metadata at 32 rows", () => {
+  const probabilities = Float32Array.from(
+    { length: 40 },
+    (_, index) => (40 - index) / 820,
+  );
+  const result = sampleDrowseTopKTopP(
+    probabilities,
+    Int32Array.from({ length: 40 }, (_, index) => index),
+    1,
+    0,
+    0.99,
+    [39],
+  );
+  expect(result.sampledTokenId).toBeGreaterThan(30);
+  expect(result.topLogprobs).toHaveLength(32);
+  expect(result.selectedLogprobs[0].token_id).toBe(39);
+  expect(result.selectedLogprobs[0].logprob).toBeLessThan(0);
+});
+
 type PipelineLike = LLMChatPipeline & Record<string, any>;
 
 function createPipeline(): PipelineLike {
@@ -94,6 +184,8 @@ function createPipeline(): PipelineLike {
   } as any;
   pipeline["config"] = {} as any;
   pipeline["outputIds"] = [];
+  pipeline["outputPrefix"] = "";
+  pipeline["drowseRawMessage"] = "";
   pipeline["appearedTokensFreq"] = new Map<number, number>();
   pipeline["stopTokens"] = [];
   pipeline["stopStr"] = [];
@@ -161,7 +253,7 @@ test.each([
   ["presence_penalty", "Make sure -2 < presence_penalty <= 2."],
   ["repetition_penalty", "Make sure `repetition_penalty` > 0."],
   ["top_p", "Make sure 0 < top_p <= 1."],
-  ["temperature", "Make sure `temperature` > 0."],
+  ["temperature", "temperature must be finite"],
 ])("rejects a NaN model default for %s", async (field, message) => {
   const pipeline = createPipeline();
   pipeline["config"] = {
@@ -201,12 +293,16 @@ test("processNextToken appends tokens until stop string reached", () => {
     max_tokens: 5,
   });
   expect(pipeline["stopTriggered"]).toBe(false);
+  expect(pipeline.getDrowseRawMessage()).toBe("partial");
+  expect(pipeline["tokenizer"].decode).toHaveBeenCalledTimes(1);
   (pipeline as any).processNextToken(2, {
     max_tokens: 5,
   });
   expect(pipeline["stopTriggered"]).toBe(true);
   expect(pipeline["finishReason"]).toBe("stop");
   expect(pipeline["outputMessage"]).toBe("partial");
+  expect(pipeline.getDrowseRawMessage()).toBe("partial<stop>");
+  expect(pipeline["tokenizer"].decode).toHaveBeenCalledTimes(2);
 });
 
 test("processNextToken respects max_tokens and updates token frequency", () => {
@@ -253,13 +349,43 @@ test("prefillStep adds thinking reply header when thinking disabled", async () =
   pipeline["tokenizer"].encode = jest.fn(() => Int32Array.from([9, 9]));
   await pipeline.prefillStep("hello", Role.user, undefined, {
     enable_thinking: false,
+    drowse_generation_role: "someone_happy",
   });
   expect(
     pipeline["conversation"].appendEmptyThinkingReplyHeader,
   ).toHaveBeenCalled();
   expect(pipeline["conversation"].appendReplyHeader).not.toHaveBeenCalled();
-  expect(pipeline["outputIds"].length).toBeGreaterThan(0);
+  expect(
+    pipeline["conversation"].appendEmptyThinkingReplyHeader,
+  ).toHaveBeenCalledWith(
+    Role.assistant,
+    "<think>\n\n</think>\n\n",
+    "someone_happy",
+  );
+  expect(pipeline["outputIds"]).toEqual([]);
+  expect(pipeline["outputPrefix"]).toBe("<think>\n\n</think>\n\n");
   expect(pipeline["processNextToken"]).toHaveBeenCalled();
+});
+
+test("thinking scaffold is context-only and does not consume max_tokens", async () => {
+  const pipeline = preparePrefillPipeline();
+  pipeline["processNextToken"] = jest.fn();
+  await pipeline.prefillStep("hello", Role.user, undefined, {
+    enable_thinking: false,
+    max_tokens: 1,
+  });
+  pipeline["processNextToken"] =
+    LLMChatPipeline.prototype["processNextToken"].bind(pipeline);
+  pipeline["tokenizer"].decode = jest.fn(() => "answer");
+
+  pipeline["processNextToken"](7, { max_tokens: 1 });
+
+  expect(pipeline["outputIds"]).toEqual([7]);
+  expect(pipeline["outputMessage"]).toBe("answer");
+  expect(pipeline["finishReason"]).toBe("length");
+  expect(pipeline["conversation"].finishReply).toHaveBeenCalledWith(
+    "<think>\n\n</think>\n\nanswer",
+  );
 });
 
 test("prefillStep appends standard reply header when thinking enabled", async () => {
@@ -272,6 +398,121 @@ test("prefillStep appends standard reply header when thinking enabled", async ()
   expect(
     pipeline["conversation"].appendEmptyThinkingReplyHeader,
   ).not.toHaveBeenCalled();
+});
+
+test("prefillStep passes a custom generated role to the assistant reply header", async () => {
+  const pipeline = preparePrefillPipeline();
+  await pipeline.prefillStep("hi", Role.user, undefined, {
+    drowse_generation_role: "forest_guide",
+  });
+  expect(pipeline["conversation"].appendReplyHeader).toHaveBeenCalledWith(
+    Role.assistant,
+    "forest_guide",
+  );
+});
+
+test("prefillStep opens a named user generation seat after assistant input", async () => {
+  const pipeline = preparePrefillPipeline();
+  await pipeline.prefillStep("Where next?", Role.assistant, "guide", {
+    drowse_generation_seat: "user",
+    drowse_generation_role: "curious_user",
+  });
+  expect(pipeline["conversation"].appendMessage).toHaveBeenCalledWith(
+    Role.assistant,
+    "Where next?",
+    "guide",
+  );
+  expect(pipeline["conversation"].appendReplyHeader).toHaveBeenCalledWith(
+    Role.user,
+    "curious_user",
+  );
+});
+
+test("Drowse tokenizer preserves leading-space and subword IDs verbatim", () => {
+  const pipeline = createPipeline();
+  pipeline["fullVocabSize"] = 256;
+  pipeline["tokenizer"].encode = jest.fn((text: string) => {
+    if (text === " leading") return Int32Array.of(31, 32);
+    if (text === "subword") return Int32Array.of(41, 42, 43);
+    return new Int32Array();
+  });
+  pipeline["tokenizer"].decode = jest.fn((ids: Int32Array) =>
+    [...ids].join(":"),
+  );
+  expect(pipeline.tokenizeDrowseText(" leading")).toEqual([31, 32]);
+  expect(pipeline.tokenizeDrowseText("subword")).toEqual([41, 42, 43]);
+  expect(pipeline.decodeDrowseTokens([31, 32])).toBe("31:32");
+});
+
+test("forced replay records the normal sample before committing the forced token", () => {
+  const pipeline = createPipeline();
+  const events: Array<string | number> = [];
+  pipeline["curRoundSampledTokens"] = 0;
+  pipeline["getTokenLogprob"] = jest.fn(
+    (emittedToken: number, _top: number, _sampler: any, replay: any) => {
+      events.push("logprob", emittedToken);
+      return {
+        token_id: emittedToken,
+        token: "forced",
+        bytes: [],
+        logprob: -3,
+        top_logprobs: [],
+        drowse_replay: replay,
+      };
+    },
+  );
+  pipeline["logitProcessor"] = {
+    processLogits: jest.fn((logits: Float32Array) => logits),
+    processSampledToken(token: number) {
+      events.push("processor", token);
+    },
+    resetState: jest.fn(),
+  } as any;
+  pipeline["grammarMatcher"] = {
+    acceptToken(token: number) {
+      events.push("grammar", token);
+      return true;
+    },
+  } as any;
+  const emitted = pipeline["commitSampledToken"](
+    7,
+    91,
+    {
+      sampledTokenId: 7,
+      sampledLogprob: -0.1,
+      selectedLogprobs: [{ token_id: 91, logprob: -3 }],
+      argmax: { token_id: 7, logprob: -0.1 },
+      topLogprobs: [{ token_id: 7, logprob: -0.1 }],
+      entropyNats: 0.5,
+      perplexity: Math.exp(0.5),
+    },
+    true,
+    0,
+    true,
+    true,
+    [91],
+  );
+  events.push("processNextToken", emitted);
+
+  expect(emitted).toBe(91);
+  expect(events).toEqual([
+    "logprob",
+    91,
+    "processor",
+    91,
+    "grammar",
+    91,
+    "processNextToken",
+    91,
+  ]);
+  expect(pipeline["tokenLogprobArray"][0].drowse_replay).toEqual({
+    emitted_token_id: 91,
+    sampled_token_id: 7,
+    forced_token_id: 91,
+    selected_logprobs: [{ token_id: 91, logprob: -3 }],
+    argmax: { token_id: 7, logprob: -0.1 },
+    top_logprobs: [{ token_id: 7, logprob: -0.1 }],
+  });
 });
 
 test("prefillStep reuses grammar matcher when schema unchanged", async () => {
@@ -381,6 +622,48 @@ test("getInputData uses cached prompts when KV cache filled", async () => {
   await (pipeline as any).getInputData();
   expect(pipeline["conversation"].getPromptArrayLastRound).toHaveBeenCalled();
 });
+
+test("text completion uses only its explicit tokenizer prefix and counts it", async () => {
+  const pipeline = createPipeline();
+  pipeline["conversation"].isTextCompletion = true;
+  pipeline["conversation"].config.system_prefix_token_ids = [99];
+  pipeline["conversation"].getPromptArrayTextCompletion = jest.fn(() => [
+    "I love marmots because",
+  ]);
+  pipeline["tokenizer"].encode = jest.fn(() => Int32Array.from([4, 5, 6]));
+  pipeline["fullVocabSize"] = 100;
+  const plain = await (pipeline as any).getInputData();
+  expect(plain.slice(0, 2)).toEqual([[[4, 5, 6]], 3]);
+  pipeline["config"].drowse_completion_prefix_token_ids = [2];
+  const prefixed = await (pipeline as any).getInputData();
+  expect(prefixed.slice(0, 2)).toEqual([[[2, 4, 5, 6]], 4]);
+  expect(pipeline["tokenizer"].encode).toHaveBeenCalledWith(
+    "I love marmots because",
+  );
+  expect(pipeline["config"].drowse_completion_prefix_token_ids).toEqual([2]);
+  pipeline["contextWindowSize"] = 3;
+  await expect((pipeline as any).getInputData()).rejects.toThrow();
+});
+
+test("chat prefix tokens count toward the context window too", async () => {
+  const pipeline = createPipeline();
+  pipeline["conversation"].config.system_prefix_token_ids = [2];
+  const prepared = await (pipeline as any).getInputData();
+  expect(prepared.slice(0, 2)).toEqual([[[2, 1]], 2]);
+});
+
+test.each([[100], [-1], [1.5], [NaN], ["2"]])(
+  "text completion rejects invalid prefix %j",
+  async (...prefix) => {
+    const pipeline = createPipeline();
+    pipeline["conversation"].isTextCompletion = true;
+    pipeline["fullVocabSize"] = 100;
+    pipeline["config"].drowse_completion_prefix_token_ids = prefix as any;
+    await expect((pipeline as any).getInputData()).rejects.toThrow(
+      "valid vocabulary token IDs",
+    );
+  },
+);
 
 test("processNextToken ignores eos when requested", () => {
   const pipeline = createPipeline();

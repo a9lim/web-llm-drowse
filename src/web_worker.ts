@@ -37,6 +37,18 @@ import {
   GetMessageParams,
   RuntimeStatsTextParams,
   CompletionStreamNextChunkParams,
+  DrowseModelParams,
+  SetDrowseRankOneProgramParams,
+  SetDrowseStructuredProgramParams,
+  UpdateDrowseStructuredControlsParams,
+  CaptureDrowseResidualsParams,
+  CaptureDrowseRankOneResidualsV1Params,
+  PrepareDrowseCaptureRowsParams,
+  TokenizeDrowseTextParams,
+  DecodeDrowseTokensParams,
+  ResolveDrowseJlensTokenDirectionsParams,
+  SetDrowseSaeDictionaryParams,
+  SetDrowseJlensDictionaryParams,
 } from "./message";
 import log from "loglevel";
 import { MLCEngine } from "./engine";
@@ -46,6 +58,56 @@ import {
 } from "./error";
 import { areArraysEqual } from "./utils";
 import { getModelIdToUse } from "./support";
+import {
+  DrowseCaptureRow,
+  DrowsePreparedCaptureRow,
+  DrowseRankOneProgram,
+  DrowseRankOneResidualCaptureV1,
+  DrowseStructuredProgram,
+  DrowseResidualCapture,
+  DrowseRuntimeCapabilities,
+  DrowseStructuredHookProfile,
+  DrowseSaeDictionary,
+  DrowseJlensDictionary,
+  DrowseJlensTopTokenReadout,
+  DrowseMeasurementBundle,
+  DrowseSaeTopFeatureReadout,
+} from "./drowse";
+
+function workerErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  const details: string[] = [];
+  const append = (value: unknown) => {
+    if (value === null || typeof value !== "object") return;
+    const record = value as Record<string, unknown>;
+    const name = typeof record.name === "string" ? record.name : undefined;
+    const message =
+      typeof record.message === "string" ? record.message : undefined;
+    if (name !== undefined || message !== undefined) {
+      details.push([name, message].filter(Boolean).join(": "));
+    }
+    for (const field of ["reason", "status"] as const) {
+      if (["string", "number"].includes(typeof record[field])) {
+        details.push(`${field}=${String(record[field])}`);
+      }
+    }
+    if (typeof record.stack === "string") details.push(record.stack);
+  };
+  append(error);
+  if (error !== null && typeof error === "object") {
+    const record = error as Record<string, unknown>;
+    append(record.error);
+    append(record.cause);
+  }
+  if (details.length !== 0) return [...new Set(details)].join("\n");
+  try {
+    const serialized = JSON.stringify(error);
+    if (serialized !== undefined && serialized !== "{}") return serialized;
+  } catch {
+    // Fall through to the stable object tag.
+  }
+  return Object.prototype.toString.call(error);
+}
 
 /**
  * Worker handler that can be used in a WebWorker
@@ -81,8 +143,8 @@ export class WebWorkerMLCEngineHandler {
   /**
    * @param engine A concrete implementation of MLCEngineInterface
    */
-  constructor() {
-    this.engine = new MLCEngine();
+  constructor(engine: MLCEngine = new MLCEngine()) {
+    this.engine = engine;
     this.loadedModelIdToAsyncGenerator = new Map<
       string,
       AsyncGenerator<ChatCompletionChunk | Completion, void, void>
@@ -121,11 +183,10 @@ export class WebWorkerMLCEngineHandler {
       };
       this.postMessage(msg);
     } catch (err) {
-      const errStr = (err as object).toString();
       const msg: WorkerResponse = {
         kind: "throw",
         uuid: uuid,
-        content: errStr,
+        content: workerErrorMessage(err),
       };
       this.postMessage(msg);
     }
@@ -160,6 +221,302 @@ export class WebWorkerMLCEngineHandler {
           const res = await this.engine.forwardTokensAndSample(
             params.inputIds,
             params.isPrefill,
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "supportsDrowseRankOneHooks": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.supportsDrowseRankOneHooks(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "supportsDrowseStructuredHooks": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.supportsDrowseStructuredHooks(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "supportsDrowseCurvedHooks": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.supportsDrowseCurvedHooks(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "supportsDrowseResidualCapture": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.supportsDrowseResidualCapture(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "supportsDrowseRankOneResidualCaptureV1": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.supportsDrowseRankOneResidualCaptureV1(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "getDrowseRuntimeCapabilities": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.getDrowseRuntimeCapabilities(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "getDrowseStructuredHookProfile": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.getDrowseStructuredHookProfile(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "tokenizeDrowseText": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as TokenizeDrowseTextParams;
+          const res = await this.engine.tokenizeDrowseText(
+            params.text,
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "decodeDrowseTokens": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DecodeDrowseTokensParams;
+          const res = await this.engine.decodeDrowseTokens(
+            params.tokenIds,
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "captureDrowseResiduals": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as CaptureDrowseResidualsParams;
+          const res = await this.engine.captureDrowseResiduals(
+            params.inputIds,
+            params.positions,
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "captureDrowseRankOneResidualsV1": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as CaptureDrowseRankOneResidualsV1Params;
+          const res = await this.engine.captureDrowseRankOneResidualsV1(
+            params.inputIds,
+            params.positions,
+            params.program,
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "prepareDrowseCaptureRows": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as PrepareDrowseCaptureRowsParams;
+          const res = await this.engine.prepareDrowseCaptureRows(
+            params.rows,
+            params.specialTokenIds,
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "setDrowseRankOneProgram": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as SetDrowseRankOneProgramParams;
+          await this.engine.setDrowseRankOneProgram(
+            params.program,
+            params.modelId,
+          );
+          onComplete?.(null);
+          return null;
+        });
+        return;
+      }
+      case "setDrowseStructuredProgram": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as SetDrowseStructuredProgramParams;
+          await this.engine.setDrowseStructuredProgram(
+            params.program,
+            params.modelId,
+          );
+          onComplete?.(null);
+          return null;
+        });
+        return;
+      }
+      case "updateDrowseStructuredControls": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as UpdateDrowseStructuredControlsParams;
+          await this.engine.updateDrowseStructuredControls(
+            params.affineActive,
+            params.curveActive,
+            params.modelId,
+          );
+          onComplete?.(null);
+          return null;
+        });
+        return;
+      }
+      case "clearDrowseRankOneProgram": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          await this.engine.clearDrowseRankOneProgram(params.modelId);
+          onComplete?.(null);
+          return null;
+        });
+        return;
+      }
+      case "setDrowseSaeDictionary": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as SetDrowseSaeDictionaryParams;
+          await this.engine.setDrowseSaeDictionary(
+            params.dictionary,
+            params.modelId,
+          );
+          onComplete?.(null);
+          return null;
+        });
+        return;
+      }
+      case "clearDrowseSaeDictionary": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          await this.engine.clearDrowseSaeDictionary(params.modelId);
+          onComplete?.(null);
+          return null;
+        });
+        return;
+      }
+      case "setDrowseJlensDictionary": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as SetDrowseJlensDictionaryParams;
+          await this.engine.setDrowseJlensDictionary(
+            params.dictionary,
+            params.modelId,
+          );
+          onComplete?.(null);
+          return null;
+        });
+        return;
+      }
+      case "clearDrowseJlensDictionary": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          await this.engine.clearDrowseJlensDictionary(params.modelId);
+          onComplete?.(null);
+          return null;
+        });
+        return;
+      }
+      case "readDrowseMeasurementBundle": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.readDrowseMeasurementBundle(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "readDrowseJlensTopTokens": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.readDrowseJlensTopTokens(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "readDrowseSaeTopFeatures": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.readDrowseSaeTopFeatures(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "readDrowseMeasurements": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.readDrowseMeasurements(params.modelId);
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "readDrowseGeometryMeasurements": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as DrowseModelParams;
+          const res = await this.engine.readDrowseGeometryMeasurements(
+            params.modelId,
+          );
+          onComplete?.(res);
+          return res;
+        });
+        return;
+      }
+      case "resolveDrowseJlensTokenDirections": {
+        this.handleTask(msg.uuid, async () => {
+          const params = msg.content as ResolveDrowseJlensTokenDirectionsParams;
+          const res = await this.engine.resolveDrowseJlensTokenDirections(
+            params.bindingId,
+            params.layerIndices,
+            params.tokenIds,
             params.modelId,
           );
           onComplete?.(res);
@@ -633,6 +990,298 @@ export class WebWorkerMLCEngine implements MLCEngineInterface {
       },
     };
     return await this.getPromise<number>(msg);
+  }
+
+  async supportsDrowseRankOneHooks(modelId?: string): Promise<boolean> {
+    const msg: WorkerRequest = {
+      kind: "supportsDrowseRankOneHooks",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<boolean>(msg);
+  }
+
+  async supportsDrowseStructuredHooks(modelId?: string): Promise<boolean> {
+    const msg: WorkerRequest = {
+      kind: "supportsDrowseStructuredHooks",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<boolean>(msg);
+  }
+
+  async supportsDrowseCurvedHooks(modelId?: string): Promise<boolean> {
+    const msg: WorkerRequest = {
+      kind: "supportsDrowseCurvedHooks",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<boolean>(msg);
+  }
+
+  async supportsDrowseResidualCapture(modelId?: string): Promise<boolean> {
+    const msg: WorkerRequest = {
+      kind: "supportsDrowseResidualCapture",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<boolean>(msg);
+  }
+
+  async supportsDrowseRankOneResidualCaptureV1(
+    modelId?: string,
+  ): Promise<boolean> {
+    const msg: WorkerRequest = {
+      kind: "supportsDrowseRankOneResidualCaptureV1",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<boolean>(msg);
+  }
+
+  async getDrowseRuntimeCapabilities(
+    modelId?: string,
+  ): Promise<DrowseRuntimeCapabilities> {
+    const msg: WorkerRequest = {
+      kind: "getDrowseRuntimeCapabilities",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<DrowseRuntimeCapabilities>(msg);
+  }
+
+  async getDrowseStructuredHookProfile(
+    modelId?: string,
+  ): Promise<DrowseStructuredHookProfile> {
+    const msg: WorkerRequest = {
+      kind: "getDrowseStructuredHookProfile",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<DrowseStructuredHookProfile>(msg);
+  }
+
+  async tokenizeDrowseText(text: string, modelId?: string): Promise<number[]> {
+    const msg: WorkerRequest = {
+      kind: "tokenizeDrowseText",
+      uuid: crypto.randomUUID(),
+      content: { text, modelId },
+    };
+    return await this.getPromise<number[]>(msg);
+  }
+
+  async decodeDrowseTokens(
+    tokenIds: readonly number[],
+    modelId?: string,
+  ): Promise<string> {
+    const msg: WorkerRequest = {
+      kind: "decodeDrowseTokens",
+      uuid: crypto.randomUUID(),
+      content: { tokenIds: [...tokenIds], modelId },
+    };
+    return await this.getPromise<string>(msg);
+  }
+
+  async captureDrowseResiduals(
+    inputIds: number[],
+    positions: number[],
+    modelId?: string,
+  ): Promise<DrowseResidualCapture> {
+    const msg: WorkerRequest = {
+      kind: "captureDrowseResiduals",
+      uuid: crypto.randomUUID(),
+      content: { inputIds, positions, modelId },
+    };
+    return await this.getPromise<DrowseResidualCapture>(msg);
+  }
+
+  async captureDrowseRankOneResidualsV1(
+    inputIds: number[],
+    positions: number[],
+    program: DrowseRankOneProgram,
+    modelId?: string,
+  ): Promise<DrowseRankOneResidualCaptureV1> {
+    const msg: WorkerRequest = {
+      kind: "captureDrowseRankOneResidualsV1",
+      uuid: crypto.randomUUID(),
+      content: { inputIds, positions, program, modelId },
+    };
+    return await this.getPromise<DrowseRankOneResidualCaptureV1>(msg);
+  }
+
+  async prepareDrowseCaptureRows(
+    rows: DrowseCaptureRow[],
+    specialTokenIds: number[],
+    modelId?: string,
+  ): Promise<DrowsePreparedCaptureRow[]> {
+    const msg: WorkerRequest = {
+      kind: "prepareDrowseCaptureRows",
+      uuid: crypto.randomUUID(),
+      content: { rows, specialTokenIds, modelId },
+    };
+    return await this.getPromise<DrowsePreparedCaptureRow[]>(msg);
+  }
+
+  async setDrowseRankOneProgram(
+    program: DrowseRankOneProgram,
+    modelId?: string,
+  ): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "setDrowseRankOneProgram",
+      uuid: crypto.randomUUID(),
+      content: { program, modelId },
+    };
+    await this.getPromise<null>(msg);
+  }
+
+  async setDrowseStructuredProgram(
+    program: DrowseStructuredProgram,
+    modelId?: string,
+  ): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "setDrowseStructuredProgram",
+      uuid: crypto.randomUUID(),
+      content: { program, modelId },
+    };
+    await this.getPromise<null>(msg);
+  }
+
+  async updateDrowseStructuredControls(
+    affineActive: Uint32Array,
+    curveActive?: Uint32Array,
+    modelId?: string,
+  ): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "updateDrowseStructuredControls",
+      uuid: crypto.randomUUID(),
+      content: { affineActive, curveActive, modelId },
+    };
+    await this.getPromise<null>(msg);
+  }
+
+  async clearDrowseRankOneProgram(modelId?: string): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "clearDrowseRankOneProgram",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    await this.getPromise<null>(msg);
+  }
+
+  async setDrowseSaeDictionary(
+    dictionary: DrowseSaeDictionary,
+    modelId?: string,
+  ): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "setDrowseSaeDictionary",
+      uuid: crypto.randomUUID(),
+      content: { dictionary, modelId },
+    };
+    await this.getPromise<null>(msg);
+  }
+
+  async clearDrowseSaeDictionary(modelId?: string): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "clearDrowseSaeDictionary",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    await this.getPromise<null>(msg);
+  }
+
+  async setDrowseJlensDictionary(
+    dictionary: DrowseJlensDictionary,
+    modelId?: string,
+  ): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "setDrowseJlensDictionary",
+      uuid: crypto.randomUUID(),
+      content: { dictionary, modelId },
+    };
+    await this.getPromise<null>(msg);
+  }
+
+  async clearDrowseJlensDictionary(modelId?: string): Promise<void> {
+    const msg: WorkerRequest = {
+      kind: "clearDrowseJlensDictionary",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    await this.getPromise<null>(msg);
+  }
+
+  async readDrowseMeasurementBundle(
+    modelId?: string,
+  ): Promise<DrowseMeasurementBundle> {
+    const msg: WorkerRequest = {
+      kind: "readDrowseMeasurementBundle",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<DrowseMeasurementBundle>(msg);
+  }
+
+  async readDrowseJlensTopTokens(
+    modelId?: string,
+  ): Promise<DrowseJlensTopTokenReadout | undefined> {
+    const msg: WorkerRequest = {
+      kind: "readDrowseJlensTopTokens",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<DrowseJlensTopTokenReadout | undefined>(msg);
+  }
+
+  async readDrowseSaeTopFeatures(
+    modelId?: string,
+  ): Promise<DrowseSaeTopFeatureReadout | undefined> {
+    const msg: WorkerRequest = {
+      kind: "readDrowseSaeTopFeatures",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<DrowseSaeTopFeatureReadout | undefined>(msg);
+  }
+
+  async readDrowseMeasurements(
+    modelId?: string,
+  ): Promise<Float32Array | undefined> {
+    const msg: WorkerRequest = {
+      kind: "readDrowseMeasurements",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<Float32Array | undefined>(msg);
+  }
+
+  async readDrowseGeometryMeasurements(
+    modelId?: string,
+  ): Promise<Float32Array | undefined> {
+    const msg: WorkerRequest = {
+      kind: "readDrowseGeometryMeasurements",
+      uuid: crypto.randomUUID(),
+      content: { modelId },
+    };
+    return await this.getPromise<Float32Array | undefined>(msg);
+  }
+
+  async resolveDrowseJlensTokenDirections(
+    bindingId: string,
+    layerIndices: readonly number[],
+    tokenIds: readonly number[],
+    modelId?: string,
+  ): Promise<Float32Array> {
+    const msg: WorkerRequest = {
+      kind: "resolveDrowseJlensTokenDirections",
+      uuid: crypto.randomUUID(),
+      content: {
+        bindingId,
+        layerIndices: Array.from(layerIndices),
+        tokenIds: Array.from(tokenIds),
+        modelId,
+      },
+    };
+    return await this.getPromise<Float32Array>(msg);
   }
 
   /**
